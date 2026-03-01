@@ -1,7 +1,5 @@
 # academic-crawler
 
-Automated academic paper ingestion pipeline for [LiterView](https://literview.co).
-
 ## What it does
 
 - **Ingest** (every 6h): Fetches new papers from OpenAlex, Crossref, and arXiv APIs across 200+ journals and 32 disciplines. Deduplicates by DOI.
