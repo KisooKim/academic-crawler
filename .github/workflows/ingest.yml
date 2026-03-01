@@ -1,0 +1,71 @@
+name: Paper Ingestion
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      skip_crossref:
+        description: 'Skip Crossref ingestion'
+        required: false
+        default: false
+        type: boolean
+      days:
+        description: 'Days to look back'
+        required: false
+        default: '7'
+        type: string
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-ingest.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-ingest.txt
+
+      - name: Ingest from OpenAlex (primary)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENALEX_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
+        working-directory: pipeline
+        run: python ingest_journals.py --days ${{ inputs.days || '7' }}
+
+      - name: Ingest from Crossref (secondary)
+        if: ${{ inputs.skip_crossref != 'true' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CROSSREF_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
+        working-directory: pipeline
+        run: python ingest_crossref.py --days ${{ inputs.days || '7' }}
+        continue-on-error: true
+
+      - name: Ingest from arXiv
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        working-directory: pipeline
+        run: python ingest_arxiv.py --max-per-category 50
+
+      - name: Deduplicate papers
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        working-directory: pipeline
+        run: python deduplicate.py --yes --method doi --days 3
+        continue-on-error: true
