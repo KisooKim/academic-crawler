@@ -76,14 +76,30 @@ def fetch_abstract_from_openalex(doi: str) -> str | None:
         return None
 
 
-def get_existing_dois(supabase) -> set:
-    """Get all existing DOIs from the database for deduplication."""
+def get_existing_dois(supabase, days: int = 30) -> set:
+    """Get recent DOIs from the database for deduplication.
+
+    Only fetches DOIs from the last N days instead of the entire table
+    to avoid timeouts on large tables (91K+ rows).
+    """
+    from datetime import datetime, timedelta
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
     dois = set()
     page_size = 1000
     offset = 0
 
     while True:
-        response = supabase.table('papers').select('doi').not_.is_('doi', 'null').range(offset, offset + page_size - 1).execute()
+        try:
+            response = (supabase.table('papers')
+                .select('doi')
+                .not_.is_('doi', 'null')
+                .gte('created_at', cutoff)
+                .range(offset, offset + page_size - 1)
+                .execute())
+        except Exception as e:
+            print(f"Warning: Error fetching existing DOIs at offset {offset}: {e}")
+            break
         if not response.data:
             break
         for row in response.data:
@@ -276,9 +292,10 @@ def main():
     disciplines_map = get_disciplines_map(supabase)
     print(f"Loaded {len(disciplines_map)} disciplines")
 
-    # Get existing DOIs for deduplication
-    print("Loading existing DOIs...")
-    existing_dois = get_existing_dois(supabase)
+    # Get existing DOIs for deduplication (only recent to avoid timeout)
+    dedup_days = max(args.days * 2, 30)
+    print(f"Loading existing DOIs from last {dedup_days} days...")
+    existing_dois = get_existing_dois(supabase, days=dedup_days)
     print(f"Found {len(existing_dois)} existing DOIs")
 
     # Build list of journals with ISSNs

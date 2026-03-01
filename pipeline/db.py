@@ -2,10 +2,29 @@
 Database client for LitPulse pipeline.
 """
 import os
+import time
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Simple retry for Supabase operations
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
+
+
+def _retry(fn, *args, **kwargs):
+    """Retry a function with exponential backoff."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            delay = RETRY_DELAY * (2 ** attempt)
+            print(f"[DB] Retry {attempt + 1}/{MAX_RETRIES} after {delay}s: {e}")
+            time.sleep(delay)
+
 
 def get_client() -> Client:
     """Get Supabase client."""
@@ -22,36 +41,40 @@ def upsert_paper(client: Client, paper: dict) -> str | None:
     """
     Insert or update a paper. Returns paper ID if successful.
     Deduplication is based on openalex_id, doi, or arxiv_id.
+    Retries on transient failures.
     """
-    # Check for existing paper
-    existing = None
+    def _do_upsert():
+        # Check for existing paper
+        existing = None
 
-    if paper.get("openalex_id"):
-        result = client.table("papers").select("id").eq("openalex_id", paper["openalex_id"]).execute()
-        if result.data:
-            existing = result.data[0]
+        if paper.get("openalex_id"):
+            result = client.table("papers").select("id").eq("openalex_id", paper["openalex_id"]).execute()
+            if result.data:
+                existing = result.data[0]
 
-    if not existing and paper.get("doi"):
-        result = client.table("papers").select("id").eq("doi", paper["doi"]).execute()
-        if result.data:
-            existing = result.data[0]
+        if not existing and paper.get("doi"):
+            result = client.table("papers").select("id").eq("doi", paper["doi"]).execute()
+            if result.data:
+                existing = result.data[0]
 
-    if not existing and paper.get("arxiv_id"):
-        result = client.table("papers").select("id").eq("arxiv_id", paper["arxiv_id"]).execute()
-        if result.data:
-            existing = result.data[0]
+        if not existing and paper.get("arxiv_id"):
+            result = client.table("papers").select("id").eq("arxiv_id", paper["arxiv_id"]).execute()
+            if result.data:
+                existing = result.data[0]
 
-    if existing:
-        # Update existing paper
-        client.table("papers").update(paper).eq("id", existing["id"]).execute()
-        return existing["id"]
-    else:
-        # Insert new paper
-        result = client.table("papers").insert(paper).execute()
-        if result.data:
-            return result.data[0]["id"]
+        if existing:
+            # Update existing paper
+            client.table("papers").update(paper).eq("id", existing["id"]).execute()
+            return existing["id"]
+        else:
+            # Insert new paper
+            result = client.table("papers").insert(paper).execute()
+            if result.data:
+                return result.data[0]["id"]
 
-    return None
+        return None
+
+    return _retry(_do_upsert)
 
 
 def get_disciplines_map(client: Client) -> dict[str, str]:
