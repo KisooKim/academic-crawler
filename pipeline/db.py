@@ -13,13 +13,25 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds
 
 
+def _is_retryable(e: Exception) -> bool:
+    """Check if an error is transient and worth retrying."""
+    err_str = str(e)
+    # Postgres error codes that should NOT be retried
+    # 23505 = unique_violation (duplicate key)
+    # 23503 = foreign_key_violation
+    # 23502 = not_null_violation
+    if "'23505'" in err_str or "'23503'" in err_str or "'23502'" in err_str:
+        return False
+    return True
+
+
 def _retry(fn, *args, **kwargs):
-    """Retry a function with exponential backoff."""
+    """Retry a function with exponential backoff. Skips non-retryable errors."""
     for attempt in range(MAX_RETRIES):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            if attempt == MAX_RETRIES - 1:
+            if not _is_retryable(e) or attempt == MAX_RETRIES - 1:
                 raise
             delay = RETRY_DELAY * (2 ** attempt)
             print(f"[DB] Retry {attempt + 1}/{MAX_RETRIES} after {delay}s: {e}")
