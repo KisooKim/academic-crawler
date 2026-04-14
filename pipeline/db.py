@@ -48,6 +48,13 @@ def execute_write(conn, sql, params=None):
         return []
 
 
+def _adapt(v):
+    """Wrap dict/list values with psycopg2 Json adapter for JSONB columns."""
+    if isinstance(v, (dict, list)):
+        return psycopg2.extras.Json(v)
+    return v
+
+
 def upsert_paper(conn, paper: dict) -> str | None:
     """
     Insert or update a paper. Returns paper ID if successful.
@@ -69,7 +76,7 @@ def upsert_paper(conn, paper: dict) -> str | None:
         cols = [k for k in paper.keys() if k != "id"]
         if cols:
             set_clause = ", ".join(f"{c} = %s" for c in cols)
-            values = [paper[c] for c in cols] + [existing["id"]]
+            values = [_adapt(paper[c]) for c in cols] + [existing["id"]]
             execute_write(conn, f"UPDATE papers SET {set_clause} WHERE id = %s", values)
         return existing["id"]
     else:
@@ -77,7 +84,7 @@ def upsert_paper(conn, paper: dict) -> str | None:
         cols = list(paper.keys())
         placeholders = ", ".join(["%s"] * len(cols))
         col_names = ", ".join(cols)
-        values = [paper[c] for c in cols]
+        values = [_adapt(paper[c]) for c in cols]
         rows = execute_write(conn, f"INSERT INTO papers ({col_names}) VALUES ({placeholders}) RETURNING id", values)
         if rows:
             return rows[0]["id"]
