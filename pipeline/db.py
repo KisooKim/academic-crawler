@@ -55,8 +55,12 @@ def execute_write(conn, sql, params=None):
 
 
 def _adapt(v):
-    """Wrap dict/list values with psycopg2 Json adapter for JSONB columns."""
-    if isinstance(v, (dict, list)):
+    """Wrap dict / list-of-dict values with psycopg2 Json adapter for JSONB columns.
+    Lists of scalars (e.g. arxiv categories -> TEXT[]) are left as-is so psycopg2
+    uses its native array adaptation."""
+    if isinstance(v, dict):
+        return psycopg2.extras.Json(v)
+    if isinstance(v, list) and v and isinstance(v[0], dict):
         return psycopg2.extras.Json(v)
     return v
 
