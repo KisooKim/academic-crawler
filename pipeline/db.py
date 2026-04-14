@@ -76,7 +76,11 @@ def upsert_paper(conn, paper: dict) -> str | None:
         existing = execute_one(conn, "SELECT id FROM papers WHERE openalex_id = %s", [paper["openalex_id"]])
 
     if not existing and paper.get("doi"):
-        existing = execute_one(conn, "SELECT id FROM papers WHERE doi = %s", [paper["doi"]])
+        existing = execute_one(
+            conn,
+            "SELECT id FROM papers WHERE normalize_doi(doi) = normalize_doi(%s)",
+            [paper["doi"]],
+        )
 
     if not existing and paper.get("arxiv_id"):
         existing = execute_one(conn, "SELECT id FROM papers WHERE arxiv_id = %s", [paper["arxiv_id"]])
