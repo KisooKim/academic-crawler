@@ -39,8 +39,7 @@ jobs:
 
       - name: Ingest from OpenAlex (primary)
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           OPENALEX_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
         working-directory: pipeline
         run: python ingest_journals.py --days ${{ inputs.days || '7' }}
@@ -48,8 +47,7 @@ jobs:
       - name: Ingest from Crossref (secondary)
         if: ${{ inputs.skip_crossref != 'true' }}
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           CROSSREF_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
         working-directory: pipeline
         run: python ingest_crossref.py --days ${{ inputs.days || '7' }}
@@ -57,16 +55,14 @@ jobs:
 
       - name: Ingest from arXiv
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
         run: python ingest_arxiv.py --max-per-category 50
         continue-on-error: true
 
       - name: Deduplicate papers
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
         run: python deduplicate.py --yes --method doi --days 3
         continue-on-error: true

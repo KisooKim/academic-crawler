@@ -1,7 +1,7 @@
 """
-classify_new_papers.py — Classify papers that have no subfield tags yet.
+classify_new_papers.py -- Classify papers that have no subfield tags yet.
 
-Designed for CI: fetches unclassified papers from Supabase, applies
+Designed for CI: fetches unclassified papers from the database, applies
 keyword matching + centroid-embedding classification, uploads results.
 
 Usage:
@@ -19,7 +19,8 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
 from dotenv import load_dotenv
-from supabase import create_client, Client
+
+from db import get_client, execute, execute_write
 
 PIPELINE_DIR = Path(__file__).parent
 load_dotenv(dotenv_path=PIPELINE_DIR.parent / ".env.local")
@@ -32,55 +33,23 @@ MAX_SUBFIELDS = 3
 BATCH_SIZE = 200
 
 
-def get_client() -> Client:
-    url = os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    if not url or not key:
-        raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
-    return create_client(url, key)
+def get_tags_map(conn) -> dict:
+    rows = execute(conn, "SELECT id, name FROM tags WHERE type = 'subfield'")
+    return {t["name"]: t["id"] for t in rows}
 
 
-def get_tags_map(client: Client) -> dict:
-    r = client.table("tags").select("id, name").eq("type", "subfield").execute()
-    return {t["name"]: t["id"] for t in r.data} if r.data else {}
-
-
-def get_unclassified_papers(client: Client, limit: int = None) -> list:
+def get_unclassified_papers(conn, limit: int = None) -> list:
     """
     Fetch papers that have no paper_tags rows at all.
-    Uses a NOT EXISTS approach via Supabase RPC or pagination filter.
     """
     print("[Classify] Fetching papers already tagged...")
-    tagged_ids = set()
-    offset = 0
-    while True:
-        r = client.table("paper_tags").select("paper_id").range(offset, offset + 999).execute()
-        batch = r.data or []
-        if not batch:
-            break
-        for row in batch:
-            tagged_ids.add(row["paper_id"])
-        if len(batch) < 1000:
-            break
-        offset += 1000
+    tagged_rows = execute(conn, "SELECT DISTINCT paper_id FROM paper_tags")
+    tagged_ids = {r["paper_id"] for r in tagged_rows}
     print(f"  {len(tagged_ids)} papers already have tags")
 
     print("[Classify] Fetching all papers...")
-    papers = []
-    offset = 0
-    while True:
-        r = client.table("papers").select("id, title, source, abstract").range(offset, offset + 999).execute()
-        batch = r.data or []
-        if not batch:
-            break
-        for p in batch:
-            if p["id"] not in tagged_ids:
-                papers.append(p)
-        if len(batch) < 1000:
-            break
-        offset += 1000
-        if limit and len(papers) >= limit * 3:  # fetch enough to find limit untagged
-            break
+    papers_rows = execute(conn, "SELECT id, title, source, abstract FROM papers")
+    papers = [p for p in papers_rows if p["id"] not in tagged_ids]
 
     if limit:
         papers = papers[:limit]
@@ -144,21 +113,28 @@ def embedding_classify(model, centroids: dict, title: str, default_threshold: fl
     return results[:MAX_SUBFIELDS]
 
 
-def flush_batch(client: Client, batch: list) -> Client:
+def flush_batch(conn, batch: list):
     if not batch:
-        return client
+        return conn
     for attempt in range(3):
         try:
-            client.table("paper_tags").upsert(batch, on_conflict="paper_id,tag_id").execute()
-            return client
+            for row in batch:
+                execute_write(conn,
+                    """INSERT INTO paper_tags (paper_id, tag_id, confidence, source)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (paper_id, tag_id) DO UPDATE SET
+                       confidence = EXCLUDED.confidence, source = EXCLUDED.source""",
+                    [row["paper_id"], row["tag_id"], row["confidence"], row["source"]])
+            return conn
         except Exception as e:
             if attempt < 2:
                 print(f"  Retry {attempt+1}: {e}")
+                conn.rollback()
                 time.sleep(2 * (attempt + 1))
-                client = get_client()
             else:
                 print(f"  Failed: {e}")
-    return client
+                conn.rollback()
+    return conn
 
 
 def main():
@@ -173,71 +149,75 @@ def main():
     print(f"[Classify] Starting at {datetime.now().isoformat()}")
     print(f"  Threshold: {threshold}  |  Limit: {limit or 'all'}")
 
-    client = get_client()
-    tags_map = get_tags_map(client)
-    centroids = load_centroids()
-    thresholds = load_thresholds()
+    conn = get_client()
 
-    print("[Classify] Loading embedding model...")
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer(EMBEDDING_MODEL)
+    try:
+        tags_map = get_tags_map(conn)
+        centroids = load_centroids()
+        thresholds = load_thresholds()
 
-    papers = get_unclassified_papers(client, limit)
-    if not papers:
-        print("[Classify] No unclassified papers found. Done.")
-        return
+        print("[Classify] Loading embedding model...")
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer(EMBEDDING_MODEL)
 
-    stats = defaultdict(int)
-    upsert_batch = []
+        papers = get_unclassified_papers(conn, limit)
+        if not papers:
+            print("[Classify] No unclassified papers found. Done.")
+            return
 
-    for i, paper in enumerate(papers):
-        paper_id = paper["id"]
-        title = paper.get("title", "") or ""
-        abstract = paper.get("abstract", "") or ""
-        source = paper.get("source", "") or ""
+        stats = defaultdict(int)
+        upsert_batch = []
 
-        kw = keyword_classify(title, abstract, source)
-        emb = embedding_classify(model, centroids, title, threshold, thresholds)
+        for i, paper in enumerate(papers):
+            paper_id = paper["id"]
+            title = paper.get("title", "") or ""
+            abstract = paper.get("abstract", "") or ""
+            source = paper.get("source", "") or ""
 
-        assigned = {}
-        for sf, conf in kw:
-            assigned[sf] = ("keyword", conf)
-        for sf, score in emb:
-            if sf not in assigned:
-                assigned[sf] = ("embedding", score)
-            if len(assigned) >= MAX_SUBFIELDS:
-                break
+            kw = keyword_classify(title, abstract, source)
+            emb = embedding_classify(model, centroids, title, threshold, thresholds)
 
-        if assigned:
-            stats["classified"] += 1
-            for sf, (src, conf) in list(assigned.items())[:MAX_SUBFIELDS]:
-                tag_id = tags_map.get(sf)
-                if tag_id:
-                    upsert_batch.append({
-                        "paper_id": paper_id,
-                        "tag_id": tag_id,
-                        "confidence": conf,
-                        "source": src,
-                    })
-        else:
-            stats["unclassified"] += 1
+            assigned = {}
+            for sf, conf in kw:
+                assigned[sf] = ("keyword", conf)
+            for sf, score in emb:
+                if sf not in assigned:
+                    assigned[sf] = ("embedding", score)
+                if len(assigned) >= MAX_SUBFIELDS:
+                    break
 
-        if len(upsert_batch) >= BATCH_SIZE:
-            client = flush_batch(client, upsert_batch)
-            upsert_batch = []
+            if assigned:
+                stats["classified"] += 1
+                for sf, (src, conf) in list(assigned.items())[:MAX_SUBFIELDS]:
+                    tag_id = tags_map.get(sf)
+                    if tag_id:
+                        upsert_batch.append({
+                            "paper_id": paper_id,
+                            "tag_id": tag_id,
+                            "confidence": conf,
+                            "source": src,
+                        })
+            else:
+                stats["unclassified"] += 1
 
-        if (i + 1) % 500 == 0:
-            print(f"  {i+1}/{len(papers)} processed...")
+            if len(upsert_batch) >= BATCH_SIZE:
+                conn = flush_batch(conn, upsert_batch)
+                upsert_batch = []
 
-    if upsert_batch:
-        client = flush_batch(client, upsert_batch)
+            if (i + 1) % 500 == 0:
+                print(f"  {i+1}/{len(papers)} processed...")
 
-    total = len(papers)
-    print("\n" + "=" * 50)
-    print(f"Total processed:  {total}")
-    print(f"Classified:       {stats['classified']} ({100*stats['classified']//max(1,total)}%)")
-    print(f"Unclassified:     {stats['unclassified']}")
-    print(f"[Classify] Done at {datetime.now().isoformat()}")
+        if upsert_batch:
+            conn = flush_batch(conn, upsert_batch)
+
+        total = len(papers)
+        print("\n" + "=" * 50)
+        print(f"Total processed:  {total}")
+        print(f"Classified:       {stats['classified']} ({100*stats['classified']//max(1,total)}%)")
+        print(f"Unclassified:     {stats['unclassified']}")
+        print(f"[Classify] Done at {datetime.now().isoformat()}")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

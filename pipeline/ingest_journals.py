@@ -75,6 +75,7 @@ def normalize_openalex(work: dict) -> dict | None:
             "name": author.get("display_name", ""),
             "affiliation": institution,
             "orcid": author.get("orcid"),
+            "openalex_id": author.get("id"),  # e.g. "https://openalex.org/A5023888391"
         })
 
     url = work.get("doi") or work.get("id")

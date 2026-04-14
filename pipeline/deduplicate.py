@@ -22,7 +22,7 @@ from typing import Optional
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from db import get_client as get_supabase_client
+from db import get_client, execute, execute_write
 
 
 def normalize_doi(doi: str | None) -> str | None:
@@ -190,119 +190,118 @@ def main():
     print("Paper Deduplication")
     print("=" * 60)
 
-    # Get Supabase client
-    supabase = get_supabase_client()
+    conn = get_client()
 
-    # Fetch candidate papers
-    cutoff = None
-    if args.days is not None:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat()
-        print(f"Fetching papers created after {cutoff} (limit: {args.limit})...")
-    else:
-        print(f"Fetching papers (limit: {args.limit})...")
+    try:
+        # Fetch candidate papers
+        cutoff = None
+        if args.days is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat()
+            print(f"Fetching papers created after {cutoff} (limit: {args.limit})...")
+        else:
+            print(f"Fetching papers (limit: {args.limit})...")
 
-    papers = []
-    page_size = 1000
-    offset = 0
-
-    while len(papers) < args.limit:
-        query = supabase.table('papers').select(
-            'id, title, authors, doi, openalex_id, published_date, abstract, upvote_count, comment_count, created_at'
-        )
         if cutoff:
-            query = query.gte('created_at', cutoff)
+            papers = execute(conn,
+                """SELECT id, title, authors, doi, openalex_id, published_date,
+                          abstract, upvote_count, comment_count, created_at
+                   FROM papers
+                   WHERE created_at >= %s
+                   ORDER BY created_at DESC
+                   LIMIT %s""",
+                [cutoff, args.limit])
+        else:
+            papers = execute(conn,
+                """SELECT id, title, authors, doi, openalex_id, published_date,
+                          abstract, upvote_count, comment_count, created_at
+                   FROM papers
+                   ORDER BY created_at DESC
+                   LIMIT %s""",
+                [args.limit])
 
-        response = query.range(offset, offset + page_size - 1).execute()
+        print(f"Loaded {len(papers)} papers")
 
-        if not response.data:
-            break
+        # Find duplicates
+        all_duplicates = []
 
-        papers.extend(response.data)
-        offset += page_size
+        if args.method in ["all", "doi"]:
+            print("\nFinding duplicates by DOI...")
+            doi_dups = find_duplicates_by_doi(papers)
+            print(f"  Found {len(doi_dups)} duplicates")
+            all_duplicates.extend(doi_dups)
 
-        if len(response.data) < page_size:
-            break
+        if args.method in ["all", "openalex"]:
+            print("\nFinding duplicates by OpenAlex ID...")
+            oa_dups = find_duplicates_by_openalex_id(papers)
+            print(f"  Found {len(oa_dups)} duplicates")
+            all_duplicates.extend(oa_dups)
 
-    print(f"Loaded {len(papers)} papers")
+        if args.method in ["all", "signature"]:
+            print("\nFinding duplicates by signature (title + author + year)...")
+            sig_dups = find_duplicates_by_signature(papers)
+            print(f"  Found {len(sig_dups)} duplicates")
+            all_duplicates.extend(sig_dups)
 
-    # Find duplicates
-    all_duplicates = []
+        # Deduplicate the duplicate list (same paper might be flagged multiple times)
+        seen_removals = set()
+        unique_duplicates = []
+        for keep_id, remove_id, method, value in all_duplicates:
+            if remove_id not in seen_removals:
+                unique_duplicates.append((keep_id, remove_id, method, value))
+                seen_removals.add(remove_id)
 
-    if args.method in ["all", "doi"]:
-        print("\nFinding duplicates by DOI...")
-        doi_dups = find_duplicates_by_doi(papers)
-        print(f"  Found {len(doi_dups)} duplicates")
-        all_duplicates.extend(doi_dups)
+        print(f"\nTotal unique duplicates to remove: {len(unique_duplicates)}")
 
-    if args.method in ["all", "openalex"]:
-        print("\nFinding duplicates by OpenAlex ID...")
-        oa_dups = find_duplicates_by_openalex_id(papers)
-        print(f"  Found {len(oa_dups)} duplicates")
-        all_duplicates.extend(oa_dups)
-
-    if args.method in ["all", "signature"]:
-        print("\nFinding duplicates by signature (title + author + year)...")
-        sig_dups = find_duplicates_by_signature(papers)
-        print(f"  Found {len(sig_dups)} duplicates")
-        all_duplicates.extend(sig_dups)
-
-    # Deduplicate the duplicate list (same paper might be flagged multiple times)
-    seen_removals = set()
-    unique_duplicates = []
-    for keep_id, remove_id, method, value in all_duplicates:
-        if remove_id not in seen_removals:
-            unique_duplicates.append((keep_id, remove_id, method, value))
-            seen_removals.add(remove_id)
-
-    print(f"\nTotal unique duplicates to remove: {len(unique_duplicates)}")
-
-    if not unique_duplicates:
-        print("No duplicates found!")
-        return
-
-    # Show sample
-    print("\nSample duplicates:")
-    for keep_id, remove_id, method, value in unique_duplicates[:10]:
-        print(f"  Keep: {keep_id[:8]}... Remove: {remove_id[:8]}... ({method}: {value[:40]}...)")
-
-    if len(unique_duplicates) > 10:
-        print(f"  ... and {len(unique_duplicates) - 10} more")
-
-    if args.dry_run:
-        print("\n[DRY RUN] Would remove duplicates but --dry-run specified")
-        return
-
-    # Confirm deletion
-    print(f"\nAbout to delete {len(unique_duplicates)} duplicate papers.")
-    if not args.yes:
-        confirm = input("Continue? (y/n): ")
-        if confirm.lower() != 'y':
-            print("Aborted.")
+        if not unique_duplicates:
+            print("No duplicates found!")
             return
 
-    # Delete duplicates
-    print("\nDeleting duplicates...")
-    deleted = 0
-    errors = 0
+        # Show sample
+        print("\nSample duplicates:")
+        for keep_id, remove_id, method, value in unique_duplicates[:10]:
+            print(f"  Keep: {keep_id[:8]}... Remove: {remove_id[:8]}... ({method}: {value[:40]}...)")
 
-    for keep_id, remove_id, method, value in unique_duplicates:
-        try:
-            # Delete related records first (paper_disciplines, paper_tags, etc.)
-            supabase.table('paper_disciplines').delete().eq('paper_id', remove_id).execute()
-            supabase.table('paper_tags').delete().eq('paper_id', remove_id).execute()
+        if len(unique_duplicates) > 10:
+            print(f"  ... and {len(unique_duplicates) - 10} more")
 
-            # Delete the paper
-            supabase.table('papers').delete().eq('id', remove_id).execute()
-            deleted += 1
+        if args.dry_run:
+            print("\n[DRY RUN] Would remove duplicates but --dry-run specified")
+            return
 
-            if deleted % 100 == 0:
-                print(f"  Deleted {deleted} papers...")
+        # Confirm deletion
+        print(f"\nAbout to delete {len(unique_duplicates)} duplicate papers.")
+        if not args.yes:
+            confirm = input("Continue? (y/n): ")
+            if confirm.lower() != 'y':
+                print("Aborted.")
+                return
 
-        except Exception as e:
-            print(f"  Error deleting {remove_id}: {e}")
-            errors += 1
+        # Delete duplicates
+        print("\nDeleting duplicates...")
+        deleted = 0
+        errors = 0
 
-    print(f"\nDone! Deleted {deleted} duplicates, {errors} errors")
+        for keep_id, remove_id, method, value in unique_duplicates:
+            try:
+                # Delete related records first (paper_disciplines, paper_tags, etc.)
+                execute_write(conn, "DELETE FROM paper_disciplines WHERE paper_id = %s", [remove_id])
+                execute_write(conn, "DELETE FROM paper_tags WHERE paper_id = %s", [remove_id])
+
+                # Delete the paper
+                execute_write(conn, "DELETE FROM papers WHERE id = %s", [remove_id])
+                deleted += 1
+
+                if deleted % 100 == 0:
+                    print(f"  Deleted {deleted} papers...")
+
+            except Exception as e:
+                print(f"  Error deleting {remove_id}: {e}")
+                conn.rollback()
+                errors += 1
+
+        print(f"\nDone! Deleted {deleted} duplicates, {errors} errors")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

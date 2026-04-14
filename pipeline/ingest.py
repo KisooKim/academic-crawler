@@ -348,6 +348,7 @@ def normalize_openalex(work: dict) -> dict | None:
             "name": author.get("display_name", ""),
             "affiliation": institution,
             "orcid": orcid,
+            "openalex_id": author.get("id"),  # e.g. "https://openalex.org/A5023888391"
         })
 
     # Get best available URL
@@ -484,33 +485,25 @@ def fetch_arxiv(max_results_per_category: int = 50, categories: list[str] | None
             "max_results": max_results_per_category,
         }
 
-        # Retry up to 3 times for transient arXiv API failures (503, timeouts)
-        for attempt in range(3):
-            try:
-                response = httpx.get(url, params=params, timeout=30)
-                response.raise_for_status()
+        try:
+            response = httpx.get(url, params=params, timeout=30)
+            response.raise_for_status()
 
-                # Parse Atom feed
-                feed = feedparser.parse(response.text)
+            # Parse Atom feed
+            feed = feedparser.parse(response.text)
 
-                cat_count = 0
-                for entry in feed.entries:
-                    paper = normalize_arxiv(entry)
-                    if paper and paper.get("arxiv_id") not in seen_ids:
-                        seen_ids.add(paper["arxiv_id"])
-                        papers.append(paper)
-                        cat_count += 1
+            cat_count = 0
+            for entry in feed.entries:
+                paper = normalize_arxiv(entry)
+                if paper and paper.get("arxiv_id") not in seen_ids:
+                    seen_ids.add(paper["arxiv_id"])
+                    papers.append(paper)
+                    cat_count += 1
 
-                print(f"[arXiv] {cat}: {cat_count} papers")
-                break  # success, exit retry loop
+            print(f"[arXiv] {cat}: {cat_count} papers")
 
-            except Exception as e:
-                if attempt < 2:
-                    wait = 5 * (attempt + 1)
-                    print(f"[arXiv] Error fetching {cat} (attempt {attempt + 1}/3, retry in {wait}s): {e}")
-                    time.sleep(wait)
-                else:
-                    print(f"[arXiv] Error fetching {cat} (giving up after 3 attempts): {e}")
+        except Exception as e:
+            print(f"[arXiv] Error fetching {cat}: {e}")
 
         time.sleep(3)  # arXiv rate limit: 1 req per 3 seconds
 

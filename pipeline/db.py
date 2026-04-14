@@ -1,204 +1,177 @@
 """
-Database client for LitPulse pipeline.
+Database client for LiterView pipeline.
+Uses psycopg2 to connect directly to Neon PostgreSQL.
 """
 import os
-import time
-from supabase import create_client, Client
+import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Simple retry for Supabase operations
-MAX_RETRIES = 3
-RETRY_DELAY = 2  # seconds
+
+def get_connection():
+    """Get a PostgreSQL connection."""
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise ValueError("Missing DATABASE_URL")
+    return psycopg2.connect(url)
 
 
-def _is_retryable(e: Exception) -> bool:
-    """Check if an error is transient and worth retrying."""
-    err_str = str(e)
-    # Postgres error codes that should NOT be retried
-    # 23505 = unique_violation (duplicate key)
-    # 23503 = foreign_key_violation
-    # 23502 = not_null_violation
-    if "'23505'" in err_str or "'23503'" in err_str or "'23502'" in err_str:
-        return False
-    return True
+def get_client():
+    """Get a database connection (backward-compatible name)."""
+    return get_connection()
 
 
-def _retry(fn, *args, **kwargs):
-    """Retry a function with exponential backoff. Skips non-retryable errors."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            if not _is_retryable(e) or attempt == MAX_RETRIES - 1:
-                raise
-            delay = RETRY_DELAY * (2 ** attempt)
-            print(f"[DB] Retry {attempt + 1}/{MAX_RETRIES} after {delay}s: {e}")
-            time.sleep(delay)
+def execute(conn, sql, params=None):
+    """Execute a query and return rows as list of dicts."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        if cur.description:
+            return [dict(row) for row in cur.fetchall()]
+        return []
 
 
-def get_client() -> Client:
-    """Get Supabase client."""
-    url = os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-
-    if not url or not key:
-        raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
-
-    return create_client(url, key)
+def execute_one(conn, sql, params=None):
+    """Execute a query and return a single row dict, or None."""
+    rows = execute(conn, sql, params)
+    return rows[0] if rows else None
 
 
-def upsert_paper(client: Client, paper: dict) -> str | None:
+def execute_write(conn, sql, params=None):
+    """Execute a write query (INSERT/UPDATE/DELETE) and commit."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        conn.commit()
+        if cur.description:
+            return [dict(row) for row in cur.fetchall()]
+        return []
+
+
+def upsert_paper(conn, paper: dict) -> str | None:
     """
     Insert or update a paper. Returns paper ID if successful.
     Deduplication is based on openalex_id, doi, or arxiv_id.
-    Retries on transient failures.
     """
-    def _do_upsert():
-        # Check for existing paper
-        existing = None
+    existing = None
 
-        if paper.get("openalex_id"):
-            result = client.table("papers").select("id").eq("openalex_id", paper["openalex_id"]).execute()
-            if result.data:
-                existing = result.data[0]
+    if paper.get("openalex_id"):
+        existing = execute_one(conn, "SELECT id FROM papers WHERE openalex_id = %s", [paper["openalex_id"]])
 
-        if not existing and paper.get("doi"):
-            result = client.table("papers").select("id").eq("doi", paper["doi"]).execute()
-            if result.data:
-                existing = result.data[0]
+    if not existing and paper.get("doi"):
+        existing = execute_one(conn, "SELECT id FROM papers WHERE doi = %s", [paper["doi"]])
 
-        if not existing and paper.get("arxiv_id"):
-            result = client.table("papers").select("id").eq("arxiv_id", paper["arxiv_id"]).execute()
-            if result.data:
-                existing = result.data[0]
+    if not existing and paper.get("arxiv_id"):
+        existing = execute_one(conn, "SELECT id FROM papers WHERE arxiv_id = %s", [paper["arxiv_id"]])
 
-        if existing:
-            # Update existing paper
-            client.table("papers").update(paper).eq("id", existing["id"]).execute()
-            return existing["id"]
-        else:
-            # Insert new paper
-            result = client.table("papers").insert(paper).execute()
-            if result.data:
-                return result.data[0]["id"]
+    if existing:
+        # Update existing paper
+        cols = [k for k in paper.keys() if k != "id"]
+        if cols:
+            set_clause = ", ".join(f"{c} = %s" for c in cols)
+            values = [paper[c] for c in cols] + [existing["id"]]
+            execute_write(conn, f"UPDATE papers SET {set_clause} WHERE id = %s", values)
+        return existing["id"]
+    else:
+        # Insert new paper
+        cols = list(paper.keys())
+        placeholders = ", ".join(["%s"] * len(cols))
+        col_names = ", ".join(cols)
+        values = [paper[c] for c in cols]
+        rows = execute_write(conn, f"INSERT INTO papers ({col_names}) VALUES ({placeholders}) RETURNING id", values)
+        if rows:
+            return rows[0]["id"]
 
-        return None
-
-    return _retry(_do_upsert)
+    return None
 
 
-def get_disciplines_map(client: Client) -> dict[str, str]:
+def get_disciplines_map(conn) -> dict[str, str]:
     """Get mapping of discipline slug -> id."""
-    result = client.table("disciplines").select("id, slug").execute()
-    return {d["slug"]: d["id"] for d in result.data} if result.data else {}
+    rows = execute(conn, "SELECT id, slug FROM disciplines")
+    return {d["slug"]: d["id"] for d in rows}
 
 
-def get_tags_map(client: Client) -> dict[str, str]:
+def get_tags_map(conn) -> dict[str, str]:
     """Get mapping of tag name -> id."""
-    result = client.table("tags").select("id, name").execute()
-    return {t["name"]: t["id"] for t in result.data} if result.data else {}
+    rows = execute(conn, "SELECT id, name FROM tags")
+    return {t["name"]: t["id"] for t in rows}
 
 
-def link_paper_to_discipline(client: Client, paper_id: str, discipline_id: str, source: str = "openalex") -> None:
+def link_paper_to_discipline(conn, paper_id: str, discipline_id: str, source: str = "openalex") -> None:
     """Link a paper to a discipline."""
     try:
-        client.table("paper_disciplines").upsert({
-            "paper_id": paper_id,
-            "discipline_id": discipline_id,
-            "source": source,
-        }, on_conflict="paper_id,discipline_id").execute()
+        execute_write(conn,
+            "INSERT INTO paper_disciplines (paper_id, discipline_id, source) VALUES (%s, %s, %s) ON CONFLICT (paper_id, discipline_id) DO NOTHING",
+            [paper_id, discipline_id, source])
     except Exception as e:
         print(f"[DB] Error linking paper to discipline: {e}")
+        conn.rollback()
 
 
-def link_paper_to_tag(client: Client, paper_id: str, tag_id: str, source: str = "openalex") -> None:
+def link_paper_to_tag(conn, paper_id: str, tag_id: str, source: str = "openalex") -> None:
     """Link a paper to a tag."""
     try:
-        client.table("paper_tags").upsert({
-            "paper_id": paper_id,
-            "tag_id": tag_id,
-            "source": source,
-        }, on_conflict="paper_id,tag_id").execute()
+        execute_write(conn,
+            "INSERT INTO paper_tags (paper_id, tag_id, source) VALUES (%s, %s, %s) ON CONFLICT (paper_id, tag_id) DO NOTHING",
+            [paper_id, tag_id, source])
     except Exception as e:
         print(f"[DB] Error linking paper to tag: {e}")
+        conn.rollback()
 
 
-def get_disciplines(client: Client) -> list[dict]:
+def get_disciplines(conn) -> list[dict]:
     """Get all disciplines."""
-    result = client.table("disciplines").select("*").order("display_order").execute()
-    return result.data if result.data else []
+    return execute(conn, "SELECT * FROM disciplines ORDER BY display_order")
 
 
-def get_recent_papers_by_discipline(client: Client, discipline_id: str, days: int = 7) -> list[dict]:
+def get_recent_papers_by_discipline(conn, discipline_id: str, days: int = 7) -> list[dict]:
     """Get recent papers for a specific discipline."""
-    from datetime import datetime, timedelta
-
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-
-    result = client.table("paper_disciplines").select(
-        "paper_id, papers(*)"
-    ).eq("discipline_id", discipline_id).gte("papers.created_at", cutoff).execute()
-
-    return [r["papers"] for r in result.data if r.get("papers")] if result.data else []
+    return execute(conn,
+        """SELECT p.* FROM paper_disciplines pd
+           JOIN papers p ON p.id = pd.paper_id
+           WHERE pd.discipline_id = %s AND p.created_at >= NOW() - interval '%s days'""",
+        [discipline_id, days])
 
 
-def get_papers_without_summary(client: Client, limit: int = 100) -> list[dict]:
+def get_papers_without_summary(conn, limit: int = 100) -> list[dict]:
     """Get papers that don't have a summary yet."""
-    result = client.table("papers").select(
-        "id, title, abstract"
-    ).is_("id", "not.in",
-        client.table("summaries").select("paper_id")
-    ).not_.is_("abstract", None).limit(limit).execute()
-
-    # Note: The above query might not work as expected.
-    # Alternative approach:
-    result = client.rpc("get_papers_without_summary", {"limit_count": limit}).execute()
-
-    return result.data if result.data else []
+    return execute(conn,
+        """SELECT p.id, p.title, p.abstract FROM papers p
+           LEFT JOIN summaries s ON s.paper_id = p.id
+           WHERE s.id IS NULL AND p.abstract IS NOT NULL
+           LIMIT %s""",
+        [limit])
 
 
-def save_summary(client: Client, paper_id: str, summary: dict, model: str) -> None:
+def save_summary(conn, paper_id: str, summary: dict, model: str) -> None:
     """Save an AI-generated summary."""
-    data = {
-        "paper_id": paper_id,
-        "llm_model": model,
-        "so_what": summary.get("so_what"),
-        "contribution": summary.get("contribution"),
-        "methodology": summary.get("methodology"),
-        "data_info": summary.get("data"),
-        "key_finding": summary.get("key_finding"),
-        "limitations": summary.get("limitations"),
-        "tags": summary.get("tags", []),
-    }
+    execute_write(conn,
+        """INSERT INTO summaries (paper_id, llm_model, so_what, contribution, methodology, data_info, key_finding, limitations)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (paper_id, llm_model) DO UPDATE SET
+           so_what = EXCLUDED.so_what, contribution = EXCLUDED.contribution,
+           methodology = EXCLUDED.methodology, data_info = EXCLUDED.data_info,
+           key_finding = EXCLUDED.key_finding, limitations = EXCLUDED.limitations""",
+        [paper_id, model,
+         summary.get("so_what"), summary.get("contribution"),
+         psycopg2.extras.Json(summary.get("methodology")),
+         psycopg2.extras.Json(summary.get("data")),
+         summary.get("key_finding"), summary.get("limitations")])
 
-    client.table("summaries").upsert(data, on_conflict="paper_id,llm_model").execute()
 
-
-def save_rankings(client: Client, date: str, discipline_id: str | None, rankings: list[dict]) -> None:
+def save_rankings(conn, date: str, discipline_id: str | None, rankings: list[dict]) -> None:
     """Save daily rankings for a discipline."""
-    data = [
-        {
-            "paper_id": r["paper_id"],
-            "ranking_date": date,
-            "discipline_id": discipline_id,
-            "rank_position": r["rank"],
-            "score": r["score"],
-            "score_breakdown": r.get("breakdown"),
-        }
-        for r in rankings
-    ]
-
-    client.table("daily_rankings").upsert(
-        data,
-        on_conflict="paper_id,ranking_date,discipline_id"
-    ).execute()
+    for r in rankings:
+        execute_write(conn,
+            """INSERT INTO daily_rankings (paper_id, ranking_date, discipline_id, rank_position, score, score_breakdown)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (paper_id, ranking_date, discipline_id) DO UPDATE SET
+               rank_position = EXCLUDED.rank_position, score = EXCLUDED.score, score_breakdown = EXCLUDED.score_breakdown""",
+            [r["paper_id"], date, discipline_id, r["rank"], r["score"],
+             psycopg2.extras.Json(r.get("breakdown"))])
 
 
-def update_paper_latest_rank(client: Client, paper_id: str, rank: int, score: float) -> None:
+def update_paper_latest_rank(conn, paper_id: str, rank: int, score: float) -> None:
     """Update denormalized rank on papers table."""
-    client.table("papers").update({
-        "latest_rank": rank,
-        "latest_score": score,
-    }).eq("id", paper_id).execute()
+    execute_write(conn, "UPDATE papers SET latest_rank = %s, latest_score = %s WHERE id = %s",
+                  [rank, score, paper_id])

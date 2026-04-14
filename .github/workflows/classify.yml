@@ -34,8 +34,7 @@ jobs:
 
       - name: Classify new papers
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
         run: python classify_new_papers.py ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
         continue-on-error: true

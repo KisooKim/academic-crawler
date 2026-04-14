@@ -24,7 +24,7 @@ import httpx
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from db import get_client as get_supabase_client, upsert_paper, link_paper_to_discipline, get_disciplines_map
+from db import get_client, execute, execute_write, upsert_paper, link_paper_to_discipline, get_disciplines_map
 from journals_config import JOURNAL_ISSNS, JOURNALS_BY_DISCIPLINE
 
 OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", os.environ.get("CROSSREF_EMAIL", ""))
@@ -76,40 +76,14 @@ def fetch_abstract_from_openalex(doi: str) -> str | None:
         return None
 
 
-def get_existing_dois(supabase, days: int = 30) -> set:
-    """Get recent DOIs from the database for deduplication.
-
-    Only fetches DOIs from the last N days instead of the entire table
-    to avoid timeouts on large tables (91K+ rows).
-    """
-    from datetime import datetime, timedelta
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-
+def get_existing_dois(conn) -> set:
+    """Get all existing DOIs from the database for deduplication."""
+    rows = execute(conn, "SELECT doi FROM papers WHERE doi IS NOT NULL")
     dois = set()
-    page_size = 1000
-    offset = 0
-
-    while True:
-        try:
-            response = (supabase.table('papers')
-                .select('doi')
-                .not_.is_('doi', 'null')
-                .gte('created_at', cutoff)
-                .range(offset, offset + page_size - 1)
-                .execute())
-        except Exception as e:
-            print(f"Warning: Error fetching existing DOIs at offset {offset}: {e}")
-            break
-        if not response.data:
-            break
-        for row in response.data:
-            doi = normalize_doi(row.get('doi'))
-            if doi:
-                dois.add(doi)
-        if len(response.data) < page_size:
-            break
-        offset += page_size
-
+    for row in rows:
+        doi = normalize_doi(row.get("doi"))
+        if doi:
+            dois.add(doi)
     return dois
 
 
@@ -285,104 +259,106 @@ def main():
     from_date = (datetime.now() - timedelta(days=args.days)).strftime("%Y-%m-%d")
     print(f"Fetching papers from {from_date}")
 
-    # Get Supabase client
-    supabase = get_supabase_client()
+    # Get database connection
+    conn = get_client()
 
-    # Load disciplines map for linking
-    disciplines_map = get_disciplines_map(supabase)
-    print(f"Loaded {len(disciplines_map)} disciplines")
+    try:
+        # Load disciplines map for linking
+        disciplines_map = get_disciplines_map(conn)
+        print(f"Loaded {len(disciplines_map)} disciplines")
 
-    # Get existing DOIs for deduplication (only recent to avoid timeout)
-    dedup_days = max(args.days * 2, 30)
-    print(f"Loading existing DOIs from last {dedup_days} days...")
-    existing_dois = get_existing_dois(supabase, days=dedup_days)
-    print(f"Found {len(existing_dois)} existing DOIs")
+        # Get existing DOIs for deduplication
+        print("Loading existing DOIs...")
+        existing_dois = get_existing_dois(conn)
+        print(f"Found {len(existing_dois)} existing DOIs")
 
-    # Build list of journals with ISSNs
-    journals_to_fetch = []
-    for journal_name, issn in JOURNAL_ISSNS.items():
-        if not issn:
-            continue
-        discipline = get_discipline_for_journal(journal_name)
-        if args.discipline and discipline != args.discipline:
-            continue
-        journals_to_fetch.append({
-            "name": journal_name,
-            "issn": issn,
-            "discipline": discipline
-        })
+        # Build list of journals with ISSNs
+        journals_to_fetch = []
+        for journal_name, issn in JOURNAL_ISSNS.items():
+            if not issn:
+                continue
+            discipline = get_discipline_for_journal(journal_name)
+            if args.discipline and discipline != args.discipline:
+                continue
+            journals_to_fetch.append({
+                "name": journal_name,
+                "issn": issn,
+                "discipline": discipline
+            })
 
-    print(f"Processing {len(journals_to_fetch)} journals with ISSNs")
+        print(f"Processing {len(journals_to_fetch)} journals with ISSNs")
 
-    # Stats
-    stats = {
-        "journals_processed": 0,
-        "papers_found": 0,
-        "papers_new": 0,
-        "papers_duplicate": 0,
-        "papers_invalid": 0,
-        "papers_inserted": 0,
-    }
+        # Stats
+        stats = {
+            "journals_processed": 0,
+            "papers_found": 0,
+            "papers_new": 0,
+            "papers_duplicate": 0,
+            "papers_invalid": 0,
+            "papers_inserted": 0,
+        }
 
-    for journal in journals_to_fetch:
-        journal_name = journal["name"]
-        issn = journal["issn"]
-        discipline = journal["discipline"]
+        for journal in journals_to_fetch:
+            journal_name = journal["name"]
+            issn = journal["issn"]
+            discipline = journal["discipline"]
 
-        print(f"\n[{discipline or 'unknown'}] {journal_name} (ISSN: {issn})...")
+            print(f"\n[{discipline or 'unknown'}] {journal_name} (ISSN: {issn})...")
 
-        works = fetch_crossref_works(issn, from_date, args.per_page)
-        stats["journals_processed"] += 1
-        stats["papers_found"] += len(works)
+            works = fetch_crossref_works(issn, from_date, args.per_page)
+            stats["journals_processed"] += 1
+            stats["papers_found"] += len(works)
 
-        if not works:
-            print(f"  No papers found")
-            continue
-
-        print(f"  Found {len(works)} papers")
-
-        for item in works:
-            paper = normalize_crossref_paper(item, journal_name)
-
-            if not paper:
-                stats["papers_invalid"] += 1
+            if not works:
+                print(f"  No papers found")
                 continue
 
-            # Check for duplicate by DOI
-            normalized_doi = normalize_doi(paper["doi"])
-            if normalized_doi in existing_dois:
-                stats["papers_duplicate"] += 1
-                continue
+            print(f"  Found {len(works)} papers")
 
-            stats["papers_new"] += 1
+            for item in works:
+                paper = normalize_crossref_paper(item, journal_name)
 
-            if args.dry_run:
-                print(f"    [DRY RUN] Would insert: {paper['title'][:60]}...")
-                continue
+                if not paper:
+                    stats["papers_invalid"] += 1
+                    continue
 
-            # Insert into database
-            try:
-                result = upsert_paper(supabase, paper)
-                if result:
-                    stats["papers_inserted"] += 1
-                    existing_dois.add(normalized_doi)  # Add to set to prevent duplicates in same run
+                # Check for duplicate by DOI
+                normalized_doi = normalize_doi(paper["doi"])
+                if normalized_doi in existing_dois:
+                    stats["papers_duplicate"] += 1
+                    continue
 
-                    # Link to discipline
-                    if discipline and discipline in disciplines_map:
-                        link_paper_to_discipline(supabase, result, disciplines_map[discipline], source="crossref")
-            except Exception as e:
-                print(f"    Error inserting paper: {e}")
+                stats["papers_new"] += 1
 
-    # Print summary
-    print("\n" + "=" * 60)
-    print("Summary")
-    print("=" * 60)
-    print(f"Journals processed:  {stats['journals_processed']}")
-    print(f"Papers found:        {stats['papers_found']}")
-    print(f"Papers new:          {stats['papers_new']}")
-    print(f"Papers duplicate:    {stats['papers_duplicate']}")
-    print(f"Papers invalid:      {stats['papers_invalid']}")
-    print(f"Papers inserted:     {stats['papers_inserted']}")
+                if args.dry_run:
+                    print(f"    [DRY RUN] Would insert: {paper['title'][:60]}...")
+                    continue
+
+                # Insert into database
+                try:
+                    result = upsert_paper(conn, paper)
+                    if result:
+                        stats["papers_inserted"] += 1
+                        existing_dois.add(normalized_doi)  # Add to set to prevent duplicates in same run
+
+                        # Link to discipline
+                        if discipline and discipline in disciplines_map:
+                            link_paper_to_discipline(conn, result, disciplines_map[discipline], source="crossref")
+                except Exception as e:
+                    print(f"    Error inserting paper: {e}")
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print("Summary")
+        print("=" * 60)
+        print(f"Journals processed:  {stats['journals_processed']}")
+        print(f"Papers found:        {stats['papers_found']}")
+        print(f"Papers new:          {stats['papers_new']}")
+        print(f"Papers duplicate:    {stats['papers_duplicate']}")
+        print(f"Papers invalid:      {stats['papers_invalid']}")
+        print(f"Papers inserted:     {stats['papers_inserted']}")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
