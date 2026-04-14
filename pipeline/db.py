@@ -39,13 +39,19 @@ def execute_one(conn, sql, params=None):
 
 
 def execute_write(conn, sql, params=None):
-    """Execute a write query (INSERT/UPDATE/DELETE) and commit."""
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(sql, params)
+    """Execute a write query (INSERT/UPDATE/DELETE) and commit. Rolls back on error."""
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if cur.description:
+                rows = [dict(row) for row in cur.fetchall()]
+            else:
+                rows = []
         conn.commit()
-        if cur.description:
-            return [dict(row) for row in cur.fetchall()]
-        return []
+        return rows
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _adapt(v):
