@@ -14,7 +14,7 @@ on:
 jobs:
   classify:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -32,7 +32,29 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements-classify.txt
 
-      - name: Classify new papers
+      - name: Cache student checkpoint
+        id: ckpt
+        uses: actions/cache@v4
+        with:
+          path: pipeline/student_prod_v1
+          key: student-ckpt-student-v1
+
+      - name: Download student checkpoint
+        if: steps.ckpt.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p pipeline/student_prod_v1
+          gh release download student-v1 --repo ${{ github.repository }} -D pipeline/student_prod_v1 --clobber
+
+      - name: Classify new papers (student, ModernBERT)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python classify_student.py --ckpt student_prod_v1 ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
+        continue-on-error: true
+
+      - name: Classify remaining (keyword + embedding fallback for no-abstract)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
