@@ -12,10 +12,12 @@ Loads a checkpoint dir saved by train_student_prod.py:
 For each target paper: build `title [| journal] [| keywords: <kw>]` + abstract
 (keywords pulled from paper_external_labels if present — empty for brand-new papers),
 sigmoid(logits) >= threshold (argmax fallback) → label slugs → paper_tags rows
-(paper_id, tag_id, confidence=score, source='student'), idempotent upsert.
+(paper_id, tag_id, confidence=score, source='student') via INSERT ... ON CONFLICT
+DO NOTHING (insert-if-absent — never overwrites another source's existing tag).
 
 Targets papers with NO paper_tags row at all (same filter as classify_new_papers.py),
-so it only touches genuinely-untagged papers — never re-labels Kimi/embedding-tagged ones.
+so it only touches genuinely-untagged papers — never re-labels Kimi/embedding-tagged ones
+(the DO NOTHING keeps that guarantee airtight even if a paper gets tagged mid-inference).
 
 Deps: torch, transformers, numpy, psycopg2 (all already present via sentence-transformers).
 
@@ -87,7 +89,10 @@ def get_keywords(conn, pids):
 
 
 def get_tag_id_map(conn):
-    return {r["name"]: r["id"] for r in execute(conn, "SELECT id, name FROM tags", [])}
+    # subfield tags only — the student emits subfield slugs; filtering by type avoids
+    # mapping a slug to the wrong tag_id should a non-subfield tag ever share its name.
+    return {r["name"]: r["id"]
+            for r in execute(conn, "SELECT id, name FROM tags WHERE type = 'subfield'", [])}
 
 
 def main() -> int:
@@ -168,8 +173,7 @@ def main() -> int:
                 execute_values(wc.cursor(), """
                     INSERT INTO paper_tags (paper_id, tag_id, confidence, source)
                     VALUES %s
-                    ON CONFLICT (paper_id, tag_id) DO UPDATE SET
-                      confidence = EXCLUDED.confidence, source = EXCLUDED.source
+                    ON CONFLICT (paper_id, tag_id) DO NOTHING
                 """, batch, page_size=1000)
                 wc.commit(); wc.close(); return
             except psycopg2.OperationalError:
