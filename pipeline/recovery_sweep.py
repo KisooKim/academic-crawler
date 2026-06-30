@@ -16,13 +16,42 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from db import get_client, execute  # noqa: E402
 import abstract_recovery as ar  # noqa: E402
+
+
+def trigger_paper_revalidation(paper_ids: list[str]) -> None:
+    """Bust the LiterView ISR cache for the /paper/<id> pages whose abstract we
+    just recovered, so they refresh immediately instead of waiting the 10m TTL.
+    Best-effort: skips if site config is missing; never raises.
+    """
+    if not paper_ids:
+        return
+    base_url = os.environ.get("SITE_URL") or os.environ.get("NEXT_PUBLIC_SITE_URL")
+    cron_secret = os.environ.get("CRON_SECRET")
+    bypass = os.environ.get("VERCEL_PROTECTION_BYPASS")
+    if not base_url or not cron_secret:
+        print(f"[revalidate] skipped ({len(paper_ids)} papers): SITE_URL/CRON_SECRET not set")
+        return
+    url = base_url.rstrip("/") + "/api/revalidate"
+    body = json.dumps({"paths": [f"/paper/{pid}" for pid in paper_ids]}).encode()
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {cron_secret}")
+    if bypass:
+        req.add_header("x-vercel-protection-bypass", bypass)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            print(f"[revalidate] {len(paper_ids)} paper pages -> HTTP {resp.status}")
+    except Exception as e:
+        print(f"[revalidate] error: {e}")
 
 SELECT_FRESH = """
 SELECT id::text AS id, doi, title
@@ -86,6 +115,17 @@ def main() -> None:
     print("[recovery] residual state distribution (abstract still NULL):")
     for r in execute(conn, STATE_DIST_SQL):
         print(f"   {r['state']:16s} {r['c']}")
+
+    # Of the papers we processed (all started abstract-NULL), those that now have
+    # an abstract were filled this run — refresh just their cached detail pages.
+    if not args.dry_run:
+        input_ids = [p["id"] for p in papers]
+        rows = execute(conn,
+                       "SELECT id::text AS id FROM papers "
+                       "WHERE id::text = ANY(%s) AND abstract IS NOT NULL",
+                       [input_ids])
+        trigger_paper_revalidation([r["id"] for r in rows])
+
     conn.close()
 
 

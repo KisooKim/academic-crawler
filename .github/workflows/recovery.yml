@@ -49,6 +49,10 @@ jobs:
           OPENALEX_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
           CROSSREF_EMAIL: ${{ secrets.CROSSREF_EMAIL }}
           UNPAYWALL_EMAIL: ${{ secrets.UNPAYWALL_EMAIL }}
+          # Refresh recovered papers' detail pages (no-op until these are set)
+          SITE_URL: ${{ secrets.SITE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          VERCEL_PROTECTION_BYPASS: ${{ secrets.VERCEL_PROTECTION_BYPASS }}
         working-directory: pipeline
         run: >
           python recovery_sweep.py
