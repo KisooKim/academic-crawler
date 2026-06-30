@@ -66,3 +66,23 @@ jobs:
         working-directory: pipeline
         run: python deduplicate.py --yes --method doi --days 3
         continue-on-error: true
+
+      # Bust the LiterView ISR cache so author/journal/subfield/discipline feed
+      # pages reflect the papers just ingested, instead of waiting for their TTL.
+      # Best-effort: never fails the ingest job. No-op until the three secrets
+      # (SITE_URL, CRON_SECRET, VERCEL_PROTECTION_BYPASS) are set on this repo.
+      - name: Revalidate site cache
+        continue-on-error: true
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          VERCEL_PROTECTION_BYPASS: ${{ secrets.VERCEL_PROTECTION_BYPASS }}
+        run: |
+          if [ -z "$SITE_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "SITE_URL or CRON_SECRET not set; skipping revalidation"
+            exit 0
+          fi
+          curl -sS -X POST "$SITE_URL/api/revalidate" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            ${VERCEL_PROTECTION_BYPASS:+-H "x-vercel-protection-bypass: $VERCEL_PROTECTION_BYPASS"} \
+            -w "\nHTTP %{http_code}\n"
