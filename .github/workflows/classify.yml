@@ -48,6 +48,7 @@ jobs:
           gh release download student-v1 --repo ${{ github.repository }} -D pipeline/student_prod_v1 --clobber
 
       - name: Classify new papers (student, ModernBERT)
+        id: student
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
@@ -55,8 +56,38 @@ jobs:
         continue-on-error: true
 
       - name: Classify remaining (keyword + embedding fallback for no-abstract)
+        if: always()
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
         run: python classify_new_papers.py ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
         continue-on-error: true
+
+      # The student step is continue-on-error so the keyword fallback still runs
+      # if it dies — but a silent student failure means that day's papers get the
+      # weaker keyword labels. Surface it (warning, not a hard page).
+      - name: Warn if student classifier failed (ntfy)
+        if: ${{ always() && steps.student.outcome == 'failure' }}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          [ -z "$NTFY_TOPIC" ] && exit 0
+          curl -sS \
+            -H "Title: LiterView student classifier FELL BACK to keyword" \
+            -H "Priority: default" \
+            -H "Tags: warning" \
+            -d "classify.yml: student step failed; keyword/embedding fallback ran instead. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/$NTFY_TOPIC"
+
+      - name: Notify on failure (ntfy)
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          [ -z "$NTFY_TOPIC" ] && { echo "NTFY_TOPIC unset; skip"; exit 0; }
+          curl -sS \
+            -H "Title: LiterView classify cron FAILED" \
+            -H "Priority: high" \
+            -H "Tags: rotating_light" \
+            -d "classify.yml failed (e.g. checkpoint download). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/$NTFY_TOPIC"

@@ -58,3 +58,16 @@ jobs:
           python recovery_sweep.py
           --limit ${{ inputs.limit || '3000' }}
           ${{ inputs.dry_run == true && '--dry-run' || '' }}
+
+      - name: Notify on failure (ntfy)
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          [ -z "$NTFY_TOPIC" ] && { echo "NTFY_TOPIC unset; skip"; exit 0; }
+          curl -sS \
+            -H "Title: LiterView abstract-recovery cron FAILED" \
+            -H "Priority: high" \
+            -H "Tags: rotating_light" \
+            -d "recovery.yml failed. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/$NTFY_TOPIC"

@@ -44,8 +44,14 @@ jobs:
         working-directory: pipeline
         run: python ingest_journals.py --days ${{ inputs.days || '7' }}
 
+      # if: always() so a failure of the OpenAlex primary above does NOT skip the
+      # backup sources (previously they were skipped exactly when most needed).
+      # continue-on-error kept on the secondaries to avoid alert fatigue from
+      # transient Crossref/arXiv blips; the primary's failure still reddens the
+      # job and fires the notify step below, and the freshness watchdog
+      # (monitor.yml) catches "no papers landed" regardless.
       - name: Ingest from Crossref (secondary)
-        if: ${{ inputs.skip_crossref != 'true' }}
+        if: ${{ always() && inputs.skip_crossref != 'true' }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           CROSSREF_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
@@ -54,6 +60,7 @@ jobs:
         continue-on-error: true
 
       - name: Ingest from arXiv
+        if: always()
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
@@ -61,6 +68,7 @@ jobs:
         continue-on-error: true
 
       - name: Deduplicate papers
+        if: always()
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
@@ -72,6 +80,7 @@ jobs:
       # Best-effort: never fails the ingest job. No-op until the three secrets
       # (SITE_URL, CRON_SECRET, VERCEL_PROTECTION_BYPASS) are set on this repo.
       - name: Revalidate site cache
+        if: always()
         continue-on-error: true
         env:
           SITE_URL: ${{ secrets.SITE_URL }}
@@ -86,3 +95,18 @@ jobs:
             -H "Authorization: Bearer $CRON_SECRET" \
             ${VERCEL_PROTECTION_BYPASS:+-H "x-vercel-protection-bypass: $VERCEL_PROTECTION_BYPASS"} \
             -w "\nHTTP %{http_code}\n"
+
+      # Fires only when a required step (OpenAlex primary, or the job overall)
+      # failed. Secondary sources keep continue-on-error so they don't page you.
+      - name: Notify on failure (ntfy)
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          [ -z "$NTFY_TOPIC" ] && { echo "NTFY_TOPIC unset; skip"; exit 0; }
+          curl -sS \
+            -H "Title: LiterView ingest cron FAILED" \
+            -H "Priority: high" \
+            -H "Tags: rotating_light" \
+            -d "ingest.yml failed. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/$NTFY_TOPIC"
