@@ -10,6 +10,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# Enrichment TEXT columns that must never be clobbered back to empty/NULL by a
+# weaker/later ingest source re-upserting a paper (e.g. abstract=None from
+# OpenAlex overwriting an abstract already recovered by the recovery cron).
+# These MUST be TEXT columns only -- the guard below uses NULLIF(%s, '').
+PRESERVE_IF_EMPTY = {"abstract", "pdf_url", "url"}
+
+
 def get_connection():
     """Get a PostgreSQL connection."""
     url = os.environ.get("DATABASE_URL")
@@ -65,6 +72,23 @@ def _adapt(v):
     return v
 
 
+def build_update_set_clause(cols: list[str]) -> str:
+    """
+    Build the comma-joined SET assignments for an UPDATE, one %s placeholder
+    per column in `cols` order. Columns in PRESERVE_IF_EMPTY use
+    COALESCE(NULLIF(%s, ''), col) so an incoming empty/NULL value does not
+    clobber a previously-stored value; all other columns are a plain
+    `col = %s` overwrite. Pure function -- no DB access, no side effects.
+    """
+    parts = []
+    for c in cols:
+        if c in PRESERVE_IF_EMPTY:
+            parts.append(f"{c} = COALESCE(NULLIF(%s, ''), {c})")
+        else:
+            parts.append(f"{c} = %s")
+    return ", ".join(parts)
+
+
 def upsert_paper(conn, paper: dict) -> str | None:
     """
     Insert or update a paper. Returns paper ID if successful.
@@ -89,7 +113,7 @@ def upsert_paper(conn, paper: dict) -> str | None:
         # Update existing paper
         cols = [k for k in paper.keys() if k != "id"]
         if cols:
-            set_clause = ", ".join(f"{c} = %s" for c in cols)
+            set_clause = build_update_set_clause(cols)
             values = [_adapt(paper[c]) for c in cols] + [existing["id"]]
             execute_write(conn, f"UPDATE papers SET {set_clause} WHERE id = %s", values)
         return existing["id"]
