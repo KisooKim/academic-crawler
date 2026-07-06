@@ -53,20 +53,28 @@ def trigger_paper_revalidation(paper_ids: list[str]) -> None:
     except Exception as e:
         print(f"[revalidate] error: {e}")
 
-SELECT_FRESH = """
+# Scope gate (A5): only spend the recovery budget on in-scope papers (linked to an
+# in-scope discipline). Out-of-scope arXiv/physics no longer starve the S2/CrossRef
+# quota. Kept identical in SELECT_FRESH and STATE_DIST_SQL so the distribution matches.
+IN_SCOPE = """EXISTS (SELECT 1 FROM paper_disciplines pd JOIN disciplines d
+             ON d.id = pd.discipline_id WHERE pd.paper_id = papers.id AND d.in_scope)"""
+
+SELECT_FRESH = f"""
 SELECT id::text AS id, doi, title
 FROM papers
 WHERE abstract IS NULL AND doi IS NOT NULL
   AND (abstract_recovery_state IS NULL
        OR (abstract_recovery_state = 'pending'
            AND abstract_recovery_last < NOW() - INTERVAL '2 days'))
+  AND {IN_SCOPE}
 ORDER BY created_at DESC NULLS LAST
 LIMIT %s
 """
 
-STATE_DIST_SQL = """
+STATE_DIST_SQL = f"""
 SELECT COALESCE(abstract_recovery_state, '(null)') AS state, COUNT(*) c
 FROM papers WHERE abstract IS NULL AND doi IS NOT NULL
+  AND {IN_SCOPE}
 GROUP BY 1 ORDER BY c DESC
 """
 

@@ -48,7 +48,14 @@ def get_unclassified_papers(conn, limit: int = None) -> list:
     print(f"  {len(tagged_ids)} papers already have tags")
 
     print("[Classify] Fetching all papers...")
-    papers_rows = execute(conn, "SELECT id, title, source, abstract FROM papers")
+    # Scope gate (A5): only fetch in-scope papers (linked to an in-scope discipline)
+    # so the fallback classifier never tags out-of-scope arXiv/physics papers.
+    papers_rows = execute(conn, """
+        SELECT p.id, p.title, p.source, p.abstract FROM papers p
+        WHERE EXISTS (SELECT 1 FROM paper_disciplines pd JOIN disciplines d
+                      ON d.id = pd.discipline_id
+                      WHERE pd.paper_id = p.id AND d.in_scope)
+    """)
     papers = [p for p in papers_rows if p["id"] not in tagged_ids]
 
     if limit:

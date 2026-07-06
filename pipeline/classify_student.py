@@ -58,6 +58,11 @@ def get_untagged_papers(conn, limit):
         FROM papers p
         WHERE NOT EXISTS (SELECT 1 FROM paper_tags pt WHERE pt.paper_id = p.id)
           AND COALESCE(LENGTH(TRIM(p.abstract)), 0) >= 1
+          -- Scope gate (A5): only classify in-scope papers (linked to an in-scope
+          -- discipline). Stops minting new wrong tags on out-of-scope arXiv/physics.
+          AND EXISTS (SELECT 1 FROM paper_disciplines pd JOIN disciplines d
+                      ON d.id = pd.discipline_id
+                      WHERE pd.paper_id = p.id AND d.in_scope)
     """
     if limit:
         sql += f" LIMIT {int(limit)}"
