@@ -37,15 +37,21 @@ jobs:
         uses: actions/cache@v4
         with:
           path: pipeline/student_prod_v1
-          key: student-ckpt-student-v1
+          # -priv suffix: bumped when the weights moved from this public repo's
+          # release to the private literview-models release (①-A). Forces a fresh
+          # download so the MODEL_TOKEN path is exercised, not a stale cache hit.
+          key: student-ckpt-student-v1-priv
 
       - name: Download student checkpoint
         if: steps.ckpt.outputs.cache-hit != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # MODEL_TOKEN = fine-grained PAT (Contents:read on KisooKim/literview-models).
+          # The default GITHUB_TOKEN is scoped to this repo only and cannot read the
+          # private model repo. Weights are kept private; compute stays free (public repo).
+          GH_TOKEN: ${{ secrets.MODEL_TOKEN }}
         run: |
           mkdir -p pipeline/student_prod_v1
-          gh release download student-v1 --repo ${{ github.repository }} -D pipeline/student_prod_v1 --clobber
+          gh release download student-v1 --repo KisooKim/literview-models -D pipeline/student_prod_v1 --clobber
 
       - name: Classify new papers (student, ModernBERT)
         id: student
