@@ -41,7 +41,7 @@ from dotenv import load_dotenv
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from db import get_client, execute  # noqa: E402
+from db import get_client, execute, resolve_paper_rows  # noqa: E402
 
 load_dotenv(dotenv_path=HERE.parent / ".env.local")
 
@@ -168,6 +168,12 @@ def main() -> int:
         for r in rows[:5]:
             print(f"  {r[0][:8]} -> {r[1]}  conf={r[2]:.3f}")
         return 0
+
+    # The paper ids in `rows` were snapshotted before the (minutes-long) inference. A merge landing
+    # in that window DELETEs the loser, so writing its id now would raise an FK violation and kill
+    # the whole execute_values chunk. Re-point through paper_redirects immediately before the write,
+    # and collapse the loser/winner rows a merge may have folded onto one (paper_id, tag_id).
+    rows, _ = resolve_paper_rows(conn, rows, key=(0, 1))
 
     # Fresh connection per batch — Neon drops the idle pooler connection during the
     # minutes-long inference, and per-batch reconnect also survives a mid-write drop.

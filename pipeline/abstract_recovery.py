@@ -30,7 +30,7 @@ from urllib.parse import quote
 import httpx
 import requests
 
-from db import execute_write
+from db import execute_write, resolve_paper_ids
 
 # ── DOI prefixes that sit behind Cloudflare and need the Home CDP drain ──────
 # (from LiterView run_l5_unified PUBLISHERS). Nature/Springer (10.1038/10.1007)
@@ -206,13 +206,27 @@ def recover_batch(conn, papers: list[dict], *, s2_keys: list[str] | None = None,
     stats: Counter = Counter()
     done: set[str] = set()
 
+    def _live_id(pid: str):
+        """The paper this snapshotted id now denotes -- itself, its merge winner, or None if it is
+        gone. `by_doi` was built by a SELECT taken before the (slow) network fetches; a merge landing
+        in between DELETEs the loser row, and `UPDATE papers ... WHERE id = <loser>` then matches ZERO
+        rows and SILENTLY discards the abstract we just paid an API call for. Resolving through
+        paper_redirects sends it to the winner instead."""
+        return resolve_paper_ids(conn, [pid]).get(str(pid))
+
     def _write(doi: str, abstract: str, source: str) -> bool:
         ok, why = is_valid_abstract(abstract, by_doi[doi]["title"])
         if not ok:
             stats[f"invalid_{source}"] += 1
             return False
         if not dry_run:
-            execute_write(conn, UPDATE_SQL, [abstract, source, by_doi[doi]["id"]])
+            pid = _live_id(by_doi[doi]["id"])
+            if pid is None:
+                stats["paper_gone"] += 1
+                return False
+            if str(pid) != str(by_doi[doi]["id"]):
+                stats["repointed_through_merge"] += 1
+            execute_write(conn, UPDATE_SQL, [abstract, source, pid])
         done.add(doi)
         stats[f"recovered_{source}"] += 1
         return True
@@ -243,13 +257,22 @@ def recover_batch(conn, papers: list[dict], *, s2_keys: list[str] | None = None,
     # -> terminal route (free_exhausted for Cloudflare = Tier-2 CDP queue, else
     # free_dead). The CASE in STATE_SQL decides pending vs terminal by age.
     if set_state:
+        # One batch resolve for the whole residual (same reason as _live_id above: these ids were
+        # snapshotted before the fetch phase). A paper that vanished entirely simply has no state to
+        # set.
+        residual_ids = [by_doi[d]["id"] for d in by_doi if d not in done]
+        live = resolve_paper_ids(conn, residual_ids) if (residual_ids and not dry_run) else {}
         for doi in by_doi:
             if doi in done:
                 continue
             stats["residual"] += 1
             stats[f"route_{state_for(doi)}"] += 1
             if not dry_run:
-                execute_write(conn, STATE_SQL, [state_for(doi), by_doi[doi]["id"]])
+                pid = live.get(str(by_doi[doi]["id"]))
+                if pid is None:
+                    stats["paper_gone"] += 1
+                    continue
+                execute_write(conn, STATE_SQL, [state_for(doi), pid])
 
     stats["processed"] = len(by_doi)
     return dict(stats)

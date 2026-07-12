@@ -1,14 +1,40 @@
 #!/usr/bin/env python3
 """
-Deduplicate papers in the database.
+Find duplicate papers in the database. REPORT-ONLY by default.
 
-This script identifies and removes duplicate papers using:
+Detection (unchanged):
 1. DOI matching (most reliable)
 2. OpenAlex ID matching
 3. Fuzzy title + author + year matching
 
+RESOLUTION -- read this before touching the flags.
+
+Until 2026-07-11 this script RESOLVED duplicates with a bare DELETE: `DELETE FROM paper_disciplines`,
+`DELETE FROM paper_tags`, then `DELETE FROM papers`. That is precisely the corruption SCHEMA_EVOLUTION
+_ADR D3 exists to forbid. The DELETE cascaded through every FK'd table (paper_subfields, summaries,
+user_saved_papers, comments, upvotes) destroying their rows, left no `paper_redirects` row so the old
+URL 404'd forever, and once the library lands (039: `library_items.paper_id` is ON DELETE RESTRICT) it
+would have started throwing and broken the ingest cron outright. It ran DAILY in the public
+academic-crawler's ingest.yml as `--yes --method doi --days 3`. It happened to be a prod no-op --
+`papers` carries a UNIQUE index on normalize_doi(doi), so exact-DOI duplicates cannot exist, and the
+one gap (this file's Python normalizer also strips a `doi:` prefix, the SQL one does not) matched zero
+prod rows -- but it was a live path to silent data loss, not a safe one.
+
+So the DELETE is GONE. The script now:
+  * default            -> DETECTS and REPORTS. Writes nothing. This is what the cron runs.
+  * --merge            -> resolves each pair through `merge_papers.merge()` (re-point every
+                          referencing row, record a redirect, then delete the loser). ATTENDED runs
+                          from the private LiterView repo only: `merge_papers` is imported lazily and
+                          does not exist in the public crawler mirror, deliberately. The first real
+                          merge in this system's history must be run by a human who has looked at the
+                          pair, not minted by a cron at 3am with a winner picked by a data-richness
+                          heuristic nobody has validated.
+  * --merge --dry-run  -> rehearses every merge and rolls it back.
+
 Usage:
-    python deduplicate.py [--dry-run] [--method all|doi|title]
+    python deduplicate.py --method doi --days 3           # report (what the cron does)
+    python deduplicate.py --method doi --merge --dry-run  # rehearse the resolution
+    python deduplicate.py --method doi --merge            # resolve, attended
 """
 
 import argparse
@@ -176,9 +202,15 @@ def find_duplicates_by_signature(papers: list) -> list[tuple]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Deduplicate papers in database")
-    parser.add_argument("--dry-run", action="store_true", help="Don't actually delete")
-    parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation (for automated runs)")
+    parser = argparse.ArgumentParser(description="Find duplicate papers (report-only unless --merge)")
+    parser.add_argument("--merge", action="store_true",
+                        help="Resolve each pair via the D3 merge primitive (merge_papers.py). "
+                             "ATTENDED, private-repo only — never enable this in a cron.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --merge: rehearse every merge and roll it back.")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="With --merge: skip the confirmation prompt. No effect on a "
+                             "report-only run (kept so the existing cron invocation still parses).")
     parser.add_argument("--method", choices=["all", "doi", "openalex", "signature"], default="all",
                        help="Deduplication method")
     parser.add_argument("--limit", type=int, default=10000, help="Max papers to process")
@@ -264,42 +296,57 @@ def main():
         if len(unique_duplicates) > 10:
             print(f"  ... and {len(unique_duplicates) - 10} more")
 
-        if args.dry_run:
-            print("\n[DRY RUN] Would remove duplicates but --dry-run specified")
+        if not args.merge:
+            print(f"\n[report-only] {len(unique_duplicates)} duplicate pair(s) found. Nothing was "
+                  f"written.")
+            print("  Resolve them with an ATTENDED run from the LiterView repo:")
+            print("    python pipeline/deduplicate.py --method <m> --merge --dry-run   # rehearse")
+            print("    python pipeline/deduplicate.py --method <m> --merge             # execute")
             return
 
-        # Confirm deletion
-        print(f"\nAbout to delete {len(unique_duplicates)} duplicate papers.")
-        if not args.yes:
-            confirm = input("Continue? (y/n): ")
-            if confirm.lower() != 'y':
+        # --merge: resolve each pair through the D3 merge primitive. Imported LAZILY -- the public
+        # academic-crawler mirror of this file has no merge_papers.py, and must not: merging is an
+        # attended, private-repo operation (see the module header).
+        from merge_papers import merge, orphan_report
+
+        print(f"\n[merge] resolving {len(unique_duplicates)} pair(s) "
+              f"{'(dry-run: each merge is rolled back)' if args.dry_run else ''}")
+        if not args.dry_run and not args.yes:
+            confirm = input(f"Merge {len(unique_duplicates)} duplicate pair(s)? (y/n): ")
+            if confirm.lower() != "y":
                 print("Aborted.")
                 return
 
-        # Delete duplicates
-        print("\nDeleting duplicates...")
-        deleted = 0
+        merged = 0
         errors = 0
-
         for keep_id, remove_id, method, value in unique_duplicates:
+            # One transaction PER PAIR, on its own connection: merge() locks the per-user library
+            # counter rows it touches, and batching many merges into one transaction would hold
+            # many users' counters (blocking their pushes) at once.
+            mconn = get_client()
             try:
-                # Delete related records first (paper_disciplines, paper_tags, etc.)
-                execute_write(conn, "DELETE FROM paper_disciplines WHERE paper_id = %s", [remove_id])
-                execute_write(conn, "DELETE FROM paper_tags WHERE paper_id = %s", [remove_id])
-
-                # Delete the paper
-                execute_write(conn, "DELETE FROM papers WHERE id = %s", [remove_id])
-                deleted += 1
-
-                if deleted % 100 == 0:
-                    print(f"  Deleted {deleted} papers...")
-
-            except Exception as e:
-                print(f"  Error deleting {remove_id}: {e}")
-                conn.rollback()
+                merge(mconn, str(remove_id), str(keep_id),
+                      reason=f"deduplicate.py {method}={value}", dry=args.dry_run)
+                merged += 1
+                if merged % 25 == 0:
+                    print(f"  merged {merged}/{len(unique_duplicates)}...")
+            except SystemExit as e:
+                # merge() aborts (not crashes) on a policy violation -- e.g. an in-scope loser whose
+                # winner is out of scope, or a RESTRICT'd table with no bespoke pass. Surface it and
+                # keep going; the pair simply stays unresolved.
+                print(f"  [skip] {remove_id[:8]} -> {keep_id[:8]}: {e}")
                 errors += 1
+            except Exception as e:
+                print(f"  [error] {remove_id[:8]} -> {keep_id[:8]}: {e}")
+                errors += 1
+            finally:
+                mconn.close()
 
-        print(f"\nDone! Deleted {deleted} duplicates, {errors} errors")
+        print(f"\nDone! merged {merged}, skipped/errored {errors}"
+              f"{' (dry-run — nothing committed)' if args.dry_run else ''}")
+        if not args.dry_run and merged:
+            orph = orphan_report(conn)
+            print(f"[orphans] {orph or 'none — 0 across all referencing tables'}")
     finally:
         conn.close()
 

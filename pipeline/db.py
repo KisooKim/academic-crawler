@@ -89,12 +89,99 @@ def build_update_set_clause(cols: list[str]) -> str:
     return ", ".join(parts)
 
 
+def clean_doi(doi: str | None) -> str | None:
+    """Strip a leading `doi:` scheme prefix (and surrounding whitespace) before a DOI is ever
+    stored.
+
+    This exists to keep ONE definition of DOI identity in the system. The DB's normalize_doi()
+    (migration 020, and the UNIQUE functional index built on it) lowercases, trims, and strips a
+    `https://doi.org/` prefix -- but NOT a `doi:` prefix. So `doi:10.1/x` and `10.1/x` are two
+    DISTINCT rows to the UNIQUE index while being the same paper to any human and to the Python-side
+    normalizer in deduplicate.py. Prod has zero such rows today; sanitizing here at the only write
+    door means it stays that way, without having to rebuild a UNIQUE functional index.
+    """
+    if not doi:
+        return None
+    doi = doi.strip()
+    if doi[:4].lower() == "doi:":
+        doi = doi[4:].strip()
+    return doi or None
+
+
+def _redirect_winner(conn, paper: dict):
+    """The live paper a merged-away incoming record now belongs to, or None.
+
+    Called ONLY after all three `papers` lookups miss. `paper_redirects` preserves the loser's
+    openalex_id / doi / arxiv_id (migrations 041 + 042) precisely so this probe can exist: without
+    it, a merged-away paper is re-INSERTed as a fresh duplicate on the next multi-source re-ingest,
+    and the dominant merge case (preprint <-> published) regenerates itself -- the redirect would
+    still resolve, but a live duplicate would now shadow the winner in every feed.
+
+    Each key is compared EXACTLY as the `papers` lookup above compares it (doi through
+    normalize_doi() on both sides; the other two by equality), or the probe would miss precisely the
+    messy-key rows that caused the duplicate in the first place.
+
+    Precedence is openalex -> doi -> arxiv (the same order as the `papers` lookups), with merged_at
+    DESC only as the tiebreaker WITHIN one key -- that is the same-key-merged-twice case. If two
+    different keys of one incoming record resolve to two DIFFERENT winners, the corpus has a real
+    identity conflict; take the highest-precedence match but say so loudly rather than swallowing it.
+    """
+    oa, doi, ax = paper.get("openalex_id"), paper.get("doi"), paper.get("arxiv_id")
+    if not (oa or doi or ax):
+        return None
+
+    rows = execute(conn, """
+        SELECT r.new_id,
+               CASE WHEN %(oa)s IS NOT NULL AND r.old_openalex_id = %(oa)s THEN 1
+                    WHEN %(doi)s IS NOT NULL AND r.old_doi IS NOT NULL
+                         AND normalize_doi(r.old_doi) = normalize_doi(%(doi)s) THEN 2
+                    ELSE 3 END AS match_priority
+          FROM paper_redirects r
+         WHERE (%(oa)s IS NOT NULL AND r.old_openalex_id = %(oa)s)
+            OR (%(doi)s IS NOT NULL AND r.old_doi IS NOT NULL
+                AND normalize_doi(r.old_doi) = normalize_doi(%(doi)s))
+            OR (%(ax)s IS NOT NULL AND r.old_arxiv_id = %(ax)s)
+         ORDER BY match_priority, r.merged_at DESC
+    """, {"oa": oa, "doi": doi, "ax": ax})
+
+    if not rows:
+        return None
+
+    winners = {str(r["new_id"]) for r in rows}
+    if len(winners) > 1:
+        print(f"[DB] WARNING: one incoming record's dedup keys resolve to {len(winners)} DIFFERENT "
+              f"merge winners {sorted(winners)} — taking the highest-precedence match. "
+              f"openalex_id={oa} doi={doi} arxiv_id={ax}")
+    return rows[0]["new_id"]
+
+
+def build_fill_empty_set_clause(cols: list[str]) -> str:
+    """SET assignments that can only ever FILL A BLANK -- `col = COALESCE(NULLIF(col,''), NULLIF(%s,''))`.
+
+    Note this is the MIRROR of build_update_set_clause(), not the same thing, and the difference is
+    load-bearing. That one is `COALESCE(NULLIF(%s,''), col)`: the INCOMING value wins whenever it is
+    non-empty, and the stored value survives only an empty incoming ("don't let a weaker source blank
+    my abstract"). Here the STORED value wins whenever it is non-empty, and the incoming value is used
+    only to fill a hole.
+
+    That is what a merge winner needs. The incoming record is a paper the winner already ABSORBED, so
+    its abstract/pdf_url must never overwrite the winner's own — but if the winner has none and the
+    absorbed record does (an abstract recovered on the preprint side), taking it is pure gain.
+    """
+    return ", ".join(f"{c} = COALESCE(NULLIF({c}, ''), NULLIF(%s, ''))" for c in cols)
+
+
 def upsert_paper(conn, paper: dict) -> str | None:
     """
     Insert or update a paper. Returns paper ID if successful.
-    Deduplication is based on openalex_id, doi, or arxiv_id.
+    Deduplication is based on openalex_id, doi, or arxiv_id -- checked against `papers` first, then
+    against `paper_redirects` (a paper that was merged away must resolve to its winner, never be
+    re-created).
     """
     existing = None
+
+    if paper.get("doi"):
+        paper["doi"] = clean_doi(paper["doi"])
 
     if paper.get("openalex_id"):
         existing = execute_one(conn, "SELECT id FROM papers WHERE openalex_id = %s", [paper["openalex_id"]])
@@ -108,6 +195,26 @@ def upsert_paper(conn, paper: dict) -> str | None:
 
     if not existing and paper.get("arxiv_id"):
         existing = execute_one(conn, "SELECT id FROM papers WHERE arxiv_id = %s", [paper["arxiv_id"]])
+
+    if not existing:
+        winner = _redirect_winner(conn, paper)
+        if winner:
+            # A merge already decided that this record IS the winner. Do NOT run the normal column
+            # update: it would write the LOSER's title / doi / openalex_id / published_date /
+            # citation_count over the winner's, flipping the winner's URL identity and undoing the
+            # merge decision.
+            #
+            # Only the PRESERVE_IF_EMPTY columns are touched, and through
+            # build_fill_empty_set_clause() -- the MIRROR of the normal clause, so the winner's own
+            # value always wins and the incoming one can only fill a hole. That keeps the single
+            # genuinely useful flow alive (an abstract recovered on the preprint side reaching a
+            # winner that has none) while making the update structurally non-destructive.
+            fill = [c for c in paper if c in PRESERVE_IF_EMPTY]
+            if fill:
+                set_clause = build_fill_empty_set_clause(fill)
+                execute_write(conn, f"UPDATE papers SET {set_clause} WHERE id = %s",
+                              [_adapt(paper[c]) for c in fill] + [winner])
+            return winner
 
     if existing:
         # Update existing paper
@@ -128,6 +235,95 @@ def upsert_paper(conn, paper: dict) -> str | None:
             return rows[0]["id"]
 
     return None
+
+
+def resolve_paper_ids(conn, ids) -> dict[str, str | None]:
+    """Map each snapshotted paper id to the live paper it now denotes.
+
+    id -> itself      the paper is still there (the overwhelming majority)
+    id -> winner id   the paper was merged away; `paper_redirects` says where it went
+    id -> None        the paper is simply gone (deleted outright, never merged)
+
+    THE STRADDLE PROBLEM. Classifier / HPC jobs snapshot paper UUIDs, spend minutes-to-days
+    computing, and only then write those UUIDs back into FK'd tables (paper_tags, paper_subfields).
+    A merge landing inside that window DELETEs the loser row, so the write raises a foreign-key
+    violation and kills the whole execute_values chunk. Resolving the ids immediately before the
+    write shrinks the exposure from days to milliseconds -- it does NOT eliminate it (a merge can
+    still land inside that gap), but the residual failure stays loud and the batch is rerunnable.
+
+    Chain compression in merge_papers.py guarantees `paper_redirects.new_id` always points at a LIVE
+    paper, so one hop is always enough. One query regardless of batch size.
+    """
+    uniq = [str(i) for i in dict.fromkeys(ids) if i]
+    if not uniq:
+        return {}
+    rows = execute(conn, """
+        SELECT i.id::text AS old, COALESCE(p.id, r.new_id)::text AS live
+          FROM unnest(%s::uuid[]) AS i(id)
+          LEFT JOIN papers p          ON p.id     = i.id
+          LEFT JOIN paper_redirects r ON r.old_id = i.id
+    """, [uniq])
+    return {r["old"]: r["live"] for r in rows}
+
+
+def resolve_paper_rows(conn, rows: list[tuple], key: tuple[int, ...] | None = None):
+    """Re-point a batch of about-to-be-written rows through resolve_paper_ids(). Element 0 of each
+    row MUST be the paper_id. Returns (rows, stats).
+
+    Rows whose paper is gone are DROPPED (there is nothing to attach them to). Rows whose paper was
+    merged are re-pointed to the winner.
+
+    `key` is the table's ON CONFLICT key as column indexes -- e.g. (0, 1) for
+    (paper_id, tag_id). Passing it is REQUIRED wherever the write uses `ON CONFLICT ... DO UPDATE`:
+    a batch that snapshotted BOTH the loser and the winner now maps two rows onto one key, and
+    Postgres rejects a single INSERT that upserts the same key twice ("ON CONFLICT DO UPDATE command
+    cannot affect row a second time"). DO NOTHING writes do not error, but pass `key` there too --
+    the collapse rule below is a correctness choice, not just an error dodge.
+
+    COLLAPSE RULE: the row whose paper_id was ALREADY the winner wins. Both rows carry a payload
+    (a confidence, a label set) computed against a different paper's text; the winner's was computed
+    against the text that survives, so it is the one that describes the row we are keeping. Ties (two
+    moved rows, or two originals) break on first-seen, which is the caller's own batch order.
+    """
+    if not rows:
+        return [], {"moved": 0, "dropped": 0, "collapsed": 0}
+
+    mapping = resolve_paper_ids(conn, [r[0] for r in rows])
+    resolved: list[tuple[tuple, bool]] = []      # (row, was_moved)
+    moved = dropped = 0
+    for r in rows:
+        live = mapping.get(str(r[0]))
+        if live is None:
+            dropped += 1
+            continue
+        was_moved = str(live) != str(r[0])
+        if was_moved:
+            moved += 1
+            r = (live,) + tuple(r[1:])
+        resolved.append((tuple(r), was_moved))
+
+    collapsed = 0
+    if key:
+        best: dict[tuple, tuple[tuple, bool]] = {}
+        for row, was_moved in resolved:
+            k = tuple(str(row[i]) for i in key)
+            incumbent = best.get(k)
+            if incumbent is None:
+                best[k] = (row, was_moved)
+            else:
+                collapsed += 1
+                # an original beats a moved row; otherwise first-seen stays
+                if incumbent[1] and not was_moved:
+                    best[k] = (row, was_moved)
+        out = [row for row, _ in best.values()]
+    else:
+        out = [row for row, _ in resolved]
+
+    stats = {"moved": moved, "dropped": dropped, "collapsed": collapsed}
+    if moved or dropped or collapsed:
+        print(f"[DB] resolve_paper_rows: {moved} re-pointed through a merge, {dropped} dropped "
+              f"(paper gone), {collapsed} collapsed onto an existing key")
+    return out, stats
 
 
 def get_disciplines_map(conn) -> dict[str, str]:

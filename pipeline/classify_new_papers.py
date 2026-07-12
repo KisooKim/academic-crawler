@@ -20,7 +20,7 @@ from collections import defaultdict
 from datetime import datetime
 from dotenv import load_dotenv
 
-from db import get_client, execute, execute_write
+from db import get_client, execute, execute_write, resolve_paper_rows
 
 PIPELINE_DIR = Path(__file__).parent
 load_dotenv(dotenv_path=PIPELINE_DIR.parent / ".env.local")
@@ -123,15 +123,23 @@ def embedding_classify(model, centroids: dict, title: str, default_threshold: fl
 def flush_batch(conn, batch: list):
     if not batch:
         return conn
+    # The ids were snapshotted before classification; a merge since then would make these writes
+    # FK-fail. Re-point through paper_redirects and collapse rows a merge folded onto one key.
+    values, _ = resolve_paper_rows(
+        conn,
+        [(r["paper_id"], r["tag_id"], r["confidence"], r["source"]) for r in batch],
+        key=(0, 1))
+    if not values:
+        return conn
     for attempt in range(3):
         try:
-            for row in batch:
+            for row in values:
                 execute_write(conn,
                     """INSERT INTO paper_tags (paper_id, tag_id, confidence, source)
                        VALUES (%s, %s, %s, %s)
                        ON CONFLICT (paper_id, tag_id) DO UPDATE SET
                        confidence = EXCLUDED.confidence, source = EXCLUDED.source""",
-                    [row["paper_id"], row["tag_id"], row["confidence"], row["source"]])
+                    list(row))
             return conn
         except Exception as e:
             if attempt < 2:

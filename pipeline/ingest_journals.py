@@ -8,15 +8,49 @@ import os
 import time
 import httpx
 from datetime import datetime, timedelta
+from pathlib import Path
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from db import get_client, upsert_paper, link_paper_to_discipline, get_disciplines_map
 from journals_config import JOURNALS_BY_DISCIPLINE
 
-load_dotenv()
+PIPELINE_DIR = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=PIPELINE_DIR.parent / ".env.local")
+load_dotenv()  # fallback for .env
 
 OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", "")
+
+
+def trigger_revalidation(saved: int) -> None:
+    """Bust the ISR cache for feed pages that depend on newly-ingested papers.
+
+    POSTs to the site's /api/revalidate (Bearer CRON_SECRET). Vercel Deployment
+    Protection is bypassed via x-vercel-protection-bypass when configured.
+    Best-effort: logs and returns on any missing-config or network error so a
+    failed cache bust never aborts the ingest run (the long TTL is the backstop).
+    """
+    base_url = os.environ.get("SITE_URL") or os.environ.get("NEXT_PUBLIC_SITE_URL")
+    cron_secret = os.environ.get("CRON_SECRET")
+    bypass = os.environ.get("VERCEL_PROTECTION_BYPASS")
+
+    if not base_url or not cron_secret:
+        print("[Revalidate] Skipped: SITE_URL or CRON_SECRET not set")
+        return
+
+    url = base_url.rstrip("/") + "/api/revalidate"
+    headers = {"Authorization": f"Bearer {cron_secret}"}
+    if bypass:
+        headers["x-vercel-protection-bypass"] = bypass
+
+    try:
+        resp = httpx.post(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            print(f"[Revalidate] OK ({saved} new papers): {resp.json().get('revalidated')}")
+        else:
+            print(f"[Revalidate] Failed ({resp.status_code}): {resp.text[:200]}")
+    except Exception as e:
+        print(f"[Revalidate] Error: {e}")
 
 
 def reconstruct_abstract(inverted_index: dict | None) -> str | None:
@@ -110,29 +144,40 @@ def normalize_openalex(work: dict) -> dict | None:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def fetch_papers_by_sources(source_ids: list[str], days: int = 7, per_page: int = 200, max_papers: int = 5000) -> list[dict]:
+def fetch_papers_by_sources(
+    source_ids: list[str],
+    from_date: str,
+    to_date: str | None = None,
+    per_page: int = 200,
+    max_papers: int = 100000,
+) -> list[dict]:
     """
-    Fetch recent papers from multiple sources via OpenAlex.
+    Fetch papers from multiple sources via OpenAlex within [from_date, to_date].
     Uses OR filter to batch all source IDs for a discipline into one query.
+    Cursor pagination (OpenAlex page-based capped at 10k).
     """
     papers = []
-    from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-
-    # OpenAlex supports OR with pipe separator
     source_filter = "|".join(source_ids)
+
+    filter_parts = [
+        f"from_publication_date:{from_date}",
+        f"primary_location.source.id:{source_filter}",
+    ]
+    if to_date:
+        filter_parts.insert(1, f"to_publication_date:{to_date}")
 
     url = "https://api.openalex.org/works"
     params = {
-        "filter": f"from_publication_date:{from_date},primary_location.source.id:{source_filter}",
+        "filter": ",".join(filter_parts),
         "sort": "publication_date:desc",
         "per-page": per_page,
     }
     if OPENALEX_EMAIL:
         params["mailto"] = OPENALEX_EMAIL
 
-    page = 1
-    while len(papers) < max_papers:
-        params["page"] = page
+    cursor = "*"
+    while cursor and len(papers) < max_papers:
+        params["cursor"] = cursor
         response = httpx.get(url, params=params, timeout=30)
         response.raise_for_status()
         data = response.json()
@@ -146,21 +191,32 @@ def fetch_papers_by_sources(source_ids: list[str], days: int = 7, per_page: int 
             if paper:
                 papers.append(paper)
 
-        # Check if more pages
-        total_count = data.get("meta", {}).get("count", 0)
-        if page * per_page >= total_count:
-            break
-
-        page += 1
+        cursor = data.get("meta", {}).get("next_cursor")
         time.sleep(0.1)
 
     return papers
 
 
-def main(days: int = 7, per_page: int = 200):
-    """Run the journal-based ingestion pipeline."""
+def main(
+    from_date: str | None = None,
+    to_date: str | None = None,
+    days: int = 7,
+    per_page: int = 200,
+    dry_run: bool = False,
+):
+    """Run the journal-based ingestion pipeline.
+
+    Either pass (from_date, to_date) for historical backfill, or leave them None
+    to use the rolling --days window (default cron behavior).
+    """
+    if from_date is None:
+        from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        window_desc = f"last {days} days (from {from_date})"
+    else:
+        window_desc = f"{from_date} to {to_date or 'now'}"
+
     print(f"[Ingest] Starting journal-based ingestion at {datetime.now().isoformat()}")
-    print(f"[Ingest] Fetching papers from last {days} days")
+    print(f"[Ingest] Window: {window_desc}  dry_run={dry_run}")
 
     # Count total journals
     total_journals = sum(len(journals) for journals in JOURNALS_BY_DISCIPLINE.values())
@@ -190,7 +246,7 @@ def main(days: int = 7, per_page: int = 200):
             continue
 
         try:
-            papers = fetch_papers_by_sources(source_ids, days=days, per_page=per_page)
+            papers = fetch_papers_by_sources(source_ids, from_date=from_date, to_date=to_date, per_page=per_page)
             new_count = 0
 
             for paper in papers:
@@ -214,6 +270,11 @@ def main(days: int = 7, per_page: int = 200):
 
     print(f"\n[Ingest] Collected {len(all_papers)} unique papers from {len(JOURNALS_BY_DISCIPLINE)} disciplines")
 
+    if dry_run:
+        print("[Ingest] --dry-run: skipping DB writes")
+        print(f"[Ingest] Completed at {datetime.now().isoformat()}")
+        return
+
     # Save to database
     saved = 0
     linked = 0
@@ -233,14 +294,37 @@ def main(days: int = 7, per_page: int = 200):
 
     print(f"[Ingest] Saved {saved} papers to database")
     print(f"[Ingest] Linked {linked} papers to disciplines")
+
+    # Only bust the cache when papers were actually written this run.
+    if saved > 0:
+        trigger_revalidation(saved)
+
     print(f"[Ingest] Completed at {datetime.now().isoformat()}")
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--days", type=int, default=7, help="Number of days to look back")
+    parser.add_argument("--days", type=int, default=7, help="Rolling window (days back from today). Ignored if --from/--year set.")
+    parser.add_argument("--from", dest="from_date", type=str, default=None, help="Start date YYYY-MM-DD (historical backfill)")
+    parser.add_argument("--to", dest="to_date", type=str, default=None, help="End date YYYY-MM-DD (optional; pairs with --from)")
+    parser.add_argument("--year", type=int, default=None, help="Shortcut: --year 2024 → --from 2024-01-01 --to 2024-12-31")
     parser.add_argument("--per-page", type=int, default=200, help="Papers per API page")
+    parser.add_argument("--dry-run", action="store_true", help="Fetch and count only; skip DB writes")
     args = parser.parse_args()
 
-    main(days=args.days, per_page=args.per_page)
+    from_date = args.from_date
+    to_date = args.to_date
+    if args.year is not None:
+        if from_date or to_date:
+            parser.error("--year cannot be combined with --from/--to")
+        from_date = f"{args.year}-01-01"
+        to_date = f"{args.year}-12-31"
+
+    main(
+        from_date=from_date,
+        to_date=to_date,
+        days=args.days,
+        per_page=args.per_page,
+        dry_run=args.dry_run,
+    )

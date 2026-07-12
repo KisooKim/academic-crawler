@@ -67,12 +67,16 @@ jobs:
         run: python ingest_arxiv.py --max-per-category 50
         continue-on-error: true
 
-      - name: Deduplicate papers
+      # REPORT-ONLY. This step used to run a bare DELETE (`--yes`), which destroyed every FK'd row
+      # of the deleted paper and left no redirect behind -- the corruption SCHEMA_EVOLUTION_ADR D3
+      # forbids. Duplicates are now RESOLVED by merge_papers.py in an attended run from the private
+      # repo; the cron's job is only to surface them. Do NOT add --merge here.
+      - name: Detect duplicate papers (report-only)
         if: always()
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
-        run: python deduplicate.py --yes --method doi --days 3
+        run: python deduplicate.py --method doi --days 3
         continue-on-error: true
 
       # Bust the LiterView ISR cache so author/journal/subfield/discipline feed
