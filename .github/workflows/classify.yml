@@ -36,11 +36,12 @@ jobs:
         id: ckpt
         uses: actions/cache@v4
         with:
-          path: pipeline/student_prod_v1
+          path: pipeline/student_prod_v2
           # -priv suffix: bumped when the weights moved from this public repo's
           # release to the private literview-models release (①-A). Forces a fresh
           # download so the MODEL_TOKEN path is exercised, not a stale cache hit.
-          key: student-ckpt-student-v1-priv
+          # v2 (Phase B, 2026-07-18): 13-way polisci taxonomy (12 slots + APE overlay).
+          key: student-ckpt-student-v2-priv
 
       - name: Download student checkpoint
         if: steps.ckpt.outputs.cache-hit != 'true'
@@ -50,15 +51,15 @@ jobs:
           # private model repo. Weights are kept private; compute stays free (public repo).
           GH_TOKEN: ${{ secrets.MODEL_TOKEN }}
         run: |
-          mkdir -p pipeline/student_prod_v1
-          gh release download student-v1 --repo KisooKim/literview-models -D pipeline/student_prod_v1 --clobber
+          mkdir -p pipeline/student_prod_v2
+          gh release download student-v2 --repo KisooKim/literview-models -D pipeline/student_prod_v2 --clobber
 
       - name: Classify new papers (student, ModernBERT)
         id: student
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
-        run: python classify_student.py --ckpt student_prod_v1 ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
+        run: python classify_student.py --ckpt student_prod_v2 ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
         continue-on-error: true
 
       - name: Classify remaining (keyword + embedding fallback for no-abstract)
