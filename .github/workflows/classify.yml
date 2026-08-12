@@ -30,6 +30,14 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
+          # CPU-only torch, installed FIRST so sentence-transformers reuses it.
+          # The default PyPI torch wheel bundles CUDA + nvidia-* deps and made the
+          # pip cache 8 GiB. Two generations of it (16 GiB) blew the 10 GB per-repo
+          # cache limit, and LRU evicted the student checkpoint cache below — which
+          # is what surfaced the stale repo path in the download step on 2026-07-26,
+          # eight days after literview-models moved to KisooLabs. The runner has no
+          # GPU, so the CUDA payload was never anything but ballast.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements-classify.txt
 
       - name: Cache student checkpoint
@@ -46,13 +54,20 @@ jobs:
       - name: Download student checkpoint
         if: steps.ckpt.outputs.cache-hit != 'true'
         env:
-          # MODEL_TOKEN = fine-grained PAT (Contents:read on KisooKim/literview-models).
-          # The default GITHUB_TOKEN is scoped to this repo only and cannot read the
-          # private model repo. Weights are kept private; compute stays free (public repo).
+          # MODEL_TOKEN = fine-grained PAT with resource owner KisooLabs
+          # (Contents:read on KisooLabs/literview-models). The default GITHUB_TOKEN is
+          # scoped to this repo only and cannot read the private model repo. Weights
+          # stay private; compute stays free (this repo is public).
+          #
+          # 2026-08-12: repo path and token both corrected. literview-models was
+          # transferred KisooKim -> KisooLabs on 2026-07-18 (Meta/Three Github PLAN.md
+          # Phase A); a fine-grained PAT binds to its resource OWNER, so the old
+          # KisooKim-scoped token stopped seeing the repo and the API 404 surfaced as
+          # "release not found". Reissued against KisooLabs.
           GH_TOKEN: ${{ secrets.MODEL_TOKEN }}
         run: |
           mkdir -p pipeline/student_prod_v2
-          gh release download student-v2 --repo KisooKim/literview-models -D pipeline/student_prod_v2 --clobber
+          gh release download student-v2 --repo KisooLabs/literview-models -D pipeline/student_prod_v2 --clobber
 
       - name: Classify new papers (student, ModernBERT)
         id: student
