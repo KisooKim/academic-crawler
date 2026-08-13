@@ -173,7 +173,17 @@ def main() -> int:
     # in that window DELETEs the loser, so writing its id now would raise an FK violation and kill
     # the whole execute_values chunk. Re-point through paper_redirects immediately before the write,
     # and collapse the loser/winner rows a merge may have folded onto one (paper_id, tag_id).
-    rows, _ = resolve_paper_rows(conn, rows, key=(0, 1))
+    #
+    # On a FRESH connection: `conn` is deliberately closed above, before inference, so that Neon's
+    # pooler never sees it idle. Passing that closed handle here raised
+    # InterfaceError("connection already closed") and discarded every assignment. This resolve step
+    # was added 2026-07-11 (merge-safety) between the pre-inference close and the per-batch
+    # reconnect that write_batch already did — the one path left holding the dead handle.
+    rc = get_client()
+    try:
+        rows, _ = resolve_paper_rows(rc, rows, key=(0, 1))
+    finally:
+        rc.close()
 
     # Fresh connection per batch — Neon drops the idle pooler connection during the
     # minutes-long inference, and per-batch reconnect also survives a mid-write drop.
