@@ -31,28 +31,27 @@ jobs:
         run: |
           pip install --upgrade pip
           # CPU-only torch, installed FIRST so sentence-transformers reuses it.
-          # The default PyPI torch wheel bundles CUDA + nvidia-* deps and made the
-          # pip cache 8 GiB. Two generations of it (16 GiB) blew the 10 GB per-repo
-          # cache limit, and LRU evicted the student checkpoint cache below — which
-          # is what surfaced the stale repo path in the download step on 2026-07-26,
-          # eight days after literview-models moved to KisooLabs. The runner has no
-          # GPU, so the CUDA payload was never anything but ballast.
+          # The default PyPI torch wheel bundles CUDA + nvidia-* deps and made this
+          # pip cache 8 GiB (280 MiB on the CPU index). Two generations of it blew the
+          # 10 GB per-repo cache quota, and the LRU eviction that followed is what
+          # chose the date a dead MODEL_TOKEN became visible — 2026-07-26, eight days
+          # after literview-models moved to KisooLabs. The runner has no GPU, so the
+          # CUDA payload was never anything but ballast. See LESSONS.md L012.
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements-classify.txt
 
-      - name: Cache student checkpoint
-        id: ckpt
-        uses: actions/cache@v4
-        with:
-          path: pipeline/student_prod_v2
-          # -priv suffix: bumped when the weights moved from this public repo's
-          # release to the private literview-models release (①-A). Forces a fresh
-          # download so the MODEL_TOKEN path is exercised, not a stale cache hit.
-          # v2 (Phase B, 2026-07-18): 13-way polisci taxonomy (12 slots + APE overlay).
-          key: student-ckpt-student-v2-priv
+      # NO CHECKPOINT CACHE — deliberate (LESSONS.md L012, 2026-08-13).
+      # An actions/cache in front of this download used to skip it whenever the cache
+      # hit, which hid a dead MODEL_TOKEN for 8 days after the 2026-07-18 org transfer
+      # and left every run silently on weaker keyword labels. Measured price of the
+      # cache: it saved 21 s/day (hit 9s vs miss 30s download + 7s save) while holding
+      # 1.36 GiB of the 10 GB repo quota. The release is already durable GitHub-hosted
+      # storage and costs no quota, so the cache stored the same bytes twice and bought
+      # a blind spot. Running the download unconditionally makes this step the monitor
+      # for the credential: if the token ever breaks again, it fails the same day.
+      # Do not reintroduce a cache here.
 
       - name: Download student checkpoint
-        if: steps.ckpt.outputs.cache-hit != 'true'
         env:
           # MODEL_TOKEN = fine-grained PAT with resource owner KisooLabs
           # (Contents:read on KisooLabs/literview-models). The default GITHUB_TOKEN is
