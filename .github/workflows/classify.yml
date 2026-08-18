@@ -40,6 +40,23 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements-classify.txt
 
+      # The checkpoint lives in the private repo KisooLabs/literview-models, which this
+      # repo's default GITHUB_TOKEN cannot read. The token is minted per run by the
+      # 'kisoo-ops-watchdog' GitHub App, scoped to that one repo at Contents:read, and
+      # expires in an hour. It replaces MODEL_TOKEN, a fine-grained PAT: those bind to a
+      # resource OWNER and live at most a year, so when literview-models moved
+      # KisooKim -> KisooLabs on 2026-07-18 the token went blind and every run stayed
+      # green anyway (LESSONS.md L012). App private keys never expire, which removes the
+      # renewal ceremony rather than rescheduling it. See Meta/Ops Structure/PLAN.md D2.
+      - name: Mint model-repo token (GitHub App)
+        id: model_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: KisooLabs
+          repositories: literview-models
+
       # NO CHECKPOINT CACHE — deliberate (LESSONS.md L012, 2026-08-13).
       # An actions/cache in front of this download used to skip it whenever the cache
       # hit, which hid a dead MODEL_TOKEN for 8 days after the 2026-07-18 org transfer
@@ -53,17 +70,9 @@ jobs:
 
       - name: Download student checkpoint
         env:
-          # MODEL_TOKEN = fine-grained PAT with resource owner KisooLabs
-          # (Contents:read on KisooLabs/literview-models). The default GITHUB_TOKEN is
-          # scoped to this repo only and cannot read the private model repo. Weights
-          # stay private; compute stays free (this repo is public).
-          #
-          # 2026-08-12: repo path and token both corrected. literview-models was
-          # transferred KisooKim -> KisooLabs on 2026-07-18 (Meta/Three Github PLAN.md
-          # Phase A); a fine-grained PAT binds to its resource OWNER, so the old
-          # KisooKim-scoped token stopped seeing the repo and the API 404 surfaced as
-          # "release not found". Reissued against KisooLabs.
-          GH_TOKEN: ${{ secrets.MODEL_TOKEN }}
+          # Installation token from the mint step above. Weights stay private; compute
+          # stays free (this repo is public). Secrets are not exposed to fork PRs.
+          GH_TOKEN: ${{ steps.model_token.outputs.token }}
         run: |
           mkdir -p pipeline/student_prod_v2
           gh release download student-v2 --repo KisooLabs/literview-models -D pipeline/student_prod_v2 --clobber
