@@ -96,28 +96,22 @@ jobs:
       # The student step is continue-on-error so the keyword fallback still runs
       # if it dies — but a silent student failure means that day's papers get the
       # weaker keyword labels. Surface it (warning, not a hard page).
-      - name: Warn if student classifier failed (ntfy)
+      - name: Warn if student classifier failed (email)
         if: ${{ always() && steps.student.outcome == 'failure' }}
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
         run: |
-          [ -z "$NTFY_TOPIC" ] && exit 0
-          curl -sS \
-            -H "Title: LiterView student classifier FELL BACK to keyword" \
-            -H "Priority: default" \
-            -H "Tags: warning" \
-            -d "classify.yml: student step failed; keyword/embedding fallback ran instead. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            "https://ntfy.sh/$NTFY_TOPIC"
+          python3 pipeline/alert_email.py \
+            --title "LiterView student classifier FELL BACK to keyword" \
+            --body "classify.yml: the student step failed and the keyword/embedding fallback ran instead, so today's labels are the weaker kind. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-      - name: Notify on failure (ntfy)
+      - name: Notify on failure (email)
         if: failure()
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
         run: |
-          [ -z "$NTFY_TOPIC" ] && { echo "NTFY_TOPIC unset; skip"; exit 0; }
-          curl -sS \
-            -H "Title: LiterView classify cron FAILED" \
-            -H "Priority: high" \
-            -H "Tags: rotating_light" \
-            -d "classify.yml failed (e.g. checkpoint download). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            "https://ntfy.sh/$NTFY_TOPIC"
+          python3 pipeline/alert_email.py \
+            --title "[URGENT] LiterView classify cron FAILED" \
+            --body "classify.yml failed (checkpoint download, DB, or the classifier itself). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

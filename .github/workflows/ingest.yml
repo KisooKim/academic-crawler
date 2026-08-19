@@ -102,15 +102,12 @@ jobs:
 
       # Fires only when a required step (OpenAlex primary, or the job overall)
       # failed. Secondary sources keep continue-on-error so they don't page you.
-      - name: Notify on failure (ntfy)
+      - name: Notify on failure (email)
         if: failure()
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
         run: |
-          [ -z "$NTFY_TOPIC" ] && { echo "NTFY_TOPIC unset; skip"; exit 0; }
-          curl -sS \
-            -H "Title: LiterView ingest cron FAILED" \
-            -H "Priority: high" \
-            -H "Tags: rotating_light" \
-            -d "ingest.yml failed. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            "https://ntfy.sh/$NTFY_TOPIC"
+          python3 pipeline/alert_email.py \
+            --title "[URGENT] LiterView ingest cron FAILED" \
+            --body "ingest.yml failed, so no new papers were ingested this cycle. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
