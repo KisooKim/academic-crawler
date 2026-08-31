@@ -51,6 +51,14 @@ CLOUDFLARE_PREFIXES = {
 GIVE_UP_AFTER = "30 days"
 RETRY_EVERY = "2 days"
 
+# Bound on how many times one 500-DOI chunk may be re-sent after a 429 before the
+# chunk is abandoned (A6). Without a bound the key-rotation retry below spins
+# forever whenever every key is throttled at once, which is the normal case since
+# all keys share the runner IP: the sweep then burns its whole GHA cycle on one
+# chunk. Abandoning a chunk is cheap because the papers it covers stay 'pending'
+# and are picked up by the next scheduled sweep.
+S2_MAX_429_RETRIES_PER_CHUNK = 6
+
 S2_BATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
 CROSSREF_URL = "https://api.crossref.org/works/"
 UNPAYWALL_URL = "https://api.unpaywall.org/v2/"
@@ -125,6 +133,7 @@ def s2_batch(dois: list[str], keys: list[str], rate: float = 1.1,
     ids = [f"DOI:{d}" for d in dois]
     key_idx = 0
     i = 0
+    throttled = 0          # 429 retries spent on the chunk at ids[i:i + 500]
     while i < len(ids):
         chunk = ids[i:i + 500]
         headers = {"x-api-key": keys[key_idx]} if keys else {}
@@ -133,20 +142,25 @@ def s2_batch(dois: list[str], keys: list[str], rate: float = 1.1,
                               json={"ids": chunk}, headers=headers, timeout=timeout)
         except Exception:
             i += 500
+            throttled = 0
             time.sleep(rate)
             continue
-        if r.status_code == 429 and keys and len(keys) > 1:
+        if (r.status_code == 429 and keys and len(keys) > 1
+                and throttled < S2_MAX_429_RETRIES_PER_CHUNK):
             key_idx = (key_idx + 1) % len(keys)
+            throttled += 1
             time.sleep(rate)
             continue                      # retry same chunk with next key
         if r.status_code != 200:
             i += 500
+            throttled = 0
             time.sleep(rate)
             continue
         try:
             results = r.json()
         except Exception:
             i += 500
+            throttled = 0
             time.sleep(rate)
             continue
         for p in results or []:
@@ -158,6 +172,7 @@ def s2_batch(dois: list[str], keys: list[str], rate: float = 1.1,
             if d and ab:
                 out[d] = ab
         i += 500
+        throttled = 0
         time.sleep(rate)
     return out
 
