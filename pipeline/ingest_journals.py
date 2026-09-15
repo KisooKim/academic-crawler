@@ -27,8 +27,10 @@ def trigger_revalidation(saved: int) -> None:
 
     POSTs to the site's /api/revalidate (Bearer CRON_SECRET). Vercel Deployment
     Protection is bypassed via x-vercel-protection-bypass when configured.
-    Best-effort: logs and returns on any missing-config or network error so a
-    failed cache bust never aborts the ingest run (the long TTL is the backstop).
+    Retries a non-2xx / network failure up to 3 times with a short backoff and
+    then RAISES: a silently swallowed failure leaves every author and feed page
+    stale until its TTL, with nothing in the cron result to show it. Missing
+    config is still a logged skip (a local run has no deployed site to bust).
     """
     base_url = os.environ.get("SITE_URL") or os.environ.get("NEXT_PUBLIC_SITE_URL")
     cron_secret = os.environ.get("CRON_SECRET")
@@ -43,14 +45,22 @@ def trigger_revalidation(saved: int) -> None:
     if bypass:
         headers["x-vercel-protection-bypass"] = bypass
 
-    try:
-        resp = httpx.post(url, headers=headers, timeout=30)
-        if resp.status_code == 200:
-            print(f"[Revalidate] OK ({saved} new papers): {resp.json().get('revalidated')}")
-        else:
-            print(f"[Revalidate] Failed ({resp.status_code}): {resp.text[:200]}")
-    except Exception as e:
-        print(f"[Revalidate] Error: {e}")
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = httpx.post(url, headers=headers, timeout=30)
+            if 200 <= resp.status_code < 300:
+                print(f"[Revalidate] OK ({saved} new papers), attempt {attempt}/{attempts}: "
+                      f"{resp.json().get('revalidated')}")
+                return
+            print(f"[Revalidate] Attempt {attempt}/{attempts} failed "
+                  f"({resp.status_code}): {resp.text[:200]}")
+        except Exception as e:
+            print(f"[Revalidate] Attempt {attempt}/{attempts} error: {e}")
+        if attempt < attempts:
+            time.sleep(2 * attempt)
+
+    raise RuntimeError(f"[Revalidate] Giving up after {attempts} attempts: {url}")
 
 
 def reconstruct_abstract(inverted_index: dict | None) -> str | None:

@@ -319,6 +319,104 @@ def is_valid_paper(title: str, source: str | None, authors: list) -> bool:
     return True
 
 
+def _fetch_crossref_authors(doi: str) -> list[dict] | None:
+    """Fetch canonical author list from Crossref for a DOI.
+
+    Returns list of {name, orcid} in order, or None on failure.
+    Crossref is authoritative for DOI metadata; used to cross-check OpenAlex's
+    author disambiguation, which occasionally merges distinct people with
+    similar initials (e.g. Frances E. Lee vs F Eun-Hyung Lee).
+    """
+    if not doi:
+        return None
+    doi_clean = doi.replace("https://doi.org/", "").replace("http://doi.org/", "")
+    try:
+        resp = httpx.get(
+            f"https://api.crossref.org/works/{doi_clean}",
+            headers={"User-Agent": "LiterView/1.0 (mailto:literview@proton.me)"},
+            timeout=8.0,
+        )
+        if resp.status_code != 200:
+            return None
+        msg = resp.json().get("message", {})
+        out = []
+        for a in msg.get("author", []):
+            given = (a.get("given") or "").strip()
+            family = (a.get("family") or "").strip()
+            name = f"{given} {family}".strip() if given else family
+            if not name:
+                continue
+            orcid = a.get("ORCID") or ""
+            orcid = orcid.replace("https://orcid.org/", "").replace("http://orcid.org/", "").strip() or None
+            out.append({"name": name, "orcid": orcid})
+        return out or None
+    except Exception:
+        return None
+
+
+def _verify_openalex_id_via_orcid(orcid: str) -> str | None:
+    """Resolve an ORCID to the true OpenAlex author ID. Returns None on failure."""
+    try:
+        resp = httpx.get(
+            f"https://api.openalex.org/authors/orcid:{orcid}",
+            params={"mailto": "literview@proton.me"},
+            timeout=8.0,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("id")
+    except Exception:
+        pass
+    return None
+
+
+def _cross_check_authors_with_crossref(doi: str, oa_authors: list[dict]) -> list[dict]:
+    """Reconcile OpenAlex author list with Crossref by position.
+
+    When Crossref has an ORCID that disagrees with the OpenAlex-reported author
+    (different name or ID), trust Crossref: use its name/ORCID and re-verify the
+    OpenAlex author ID via ORCID lookup. Prevents propagation of OpenAlex
+    disambiguation errors.
+    """
+    cr_authors = _fetch_crossref_authors(doi)
+    if not cr_authors:
+        return oa_authors
+
+    for i, oa in enumerate(oa_authors):
+        if i >= len(cr_authors):
+            break
+        cr = cr_authors[i]
+        cr_orcid = cr.get("orcid")
+        oa_orcid = oa.get("orcid")
+        oa_name = (oa.get("name") or "").strip()
+        cr_name = (cr.get("name") or "").strip()
+
+        # Name conflict signal: last tokens disagree or initials don't match
+        def _last(n: str) -> str:
+            return n.split()[-1].lower() if n else ""
+        name_conflict = cr_name and oa_name and _last(cr_name) != _last(oa_name)
+
+        if cr_orcid and (oa_orcid != cr_orcid or name_conflict):
+            # Crossref has ORCID and OpenAlex either lacks it or disagrees.
+            # Trust Crossref; re-verify OpenAlex ID via ORCID.
+            verified_id = _verify_openalex_id_via_orcid(cr_orcid)
+            if verified_id != oa.get("openalex_id"):
+                print(f"  [CrossCheck] Author mismatch for {doi}: "
+                      f"OA='{oa_name}' ({oa.get('openalex_id')}) -> "
+                      f"CR='{cr_name}' (orcid:{cr_orcid}, verified_oa={verified_id})")
+            oa["name"] = cr_name
+            oa["orcid"] = cr_orcid
+            oa["openalex_id"] = verified_id  # may be None; safer than a wrong ID
+        elif cr_name and not oa_orcid and _last(cr_name) != _last(oa_name):
+            # No ORCID either side but names disagree at family name — null the
+            # OpenAlex ID to avoid linking to the wrong author profile.
+            print(f"  [CrossCheck] Name-only mismatch for {doi}: "
+                  f"OA='{oa_name}' -> CR='{cr_name}' (nulling openalex_id)")
+            oa["name"] = cr_name
+            oa["openalex_id"] = None
+
+    return oa_authors
+
+
 def normalize_openalex(work: dict) -> dict | None:
     """Convert OpenAlex work to our paper format."""
     title = work.get("title")
@@ -350,6 +448,11 @@ def normalize_openalex(work: dict) -> dict | None:
             "orcid": orcid,
             "openalex_id": author.get("id"),  # e.g. "https://openalex.org/A5023888391"
         })
+
+    # Cross-check authors against Crossref when DOI is available.
+    doi_for_check = work.get("doi")
+    if doi_for_check and authors:
+        authors = _cross_check_authors_with_crossref(doi_for_check, authors)
 
     # Get best available URL
     url = work.get("doi") or work.get("id")

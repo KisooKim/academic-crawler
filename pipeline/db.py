@@ -7,6 +7,11 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
+try:  # consumers that put pipeline/ on sys.path (every pipeline script)
+    from text_norm import decode_refs, normalize_text
+except ImportError:  # consumers that import this as a package (classifier/manual_label/app.py)
+    from pipeline.text_norm import decode_refs, normalize_text
+
 load_dotenv()
 
 
@@ -179,6 +184,17 @@ def upsert_paper(conn, paper: dict) -> str | None:
     re-created).
     """
     existing = None
+
+    # The one place well-formed HTML character references are decoded, and publisher
+    # extraction defects repaired, on the write path
+    # (docs/MARKUP_POLICY_WORKORDER.md T2). It lives here, not at the call sites, because
+    # every ingest writer funnels through upsert_paper() and decode_refs() is NOT idempotent:
+    # applying it twice turns "&amp;lt;" into "<" and destroys a genuinely double-escaped
+    # string. Raw publisher markup is deliberately left alone; the render path interprets it.
+    if paper.get("title"):
+        paper["title"] = normalize_text(decode_refs(paper["title"]))
+    if paper.get("abstract"):
+        paper["abstract"] = normalize_text(decode_refs(paper["abstract"]))
 
     if paper.get("doi"):
         paper["doi"] = clean_doi(paper["doi"])
