@@ -79,6 +79,20 @@ jobs:
         run: python deduplicate.py --method doi --days 3
         continue-on-error: true
 
+      # LiterView W-E3 (charter D-W3-6): a paper the browser extension captured before it was in
+      # the corpus left a library_capture_queue row (migration 047). Now that this cycle's papers
+      # have landed, link each such library item to its corpus row, or leave it pending for the
+      # next cycle. Never writes to `papers`. A row the drain cannot resolve is marked `failed` in
+      # the table itself, so the step does not page (same policy as the secondary sources).
+      # drain_capture_queue.py and merge_papers.py are copies of the LiterView masters.
+      - name: Drain the library capture queue
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python drain_capture_queue.py
+        continue-on-error: true
+
       # Bust the LiterView ISR cache so author/journal/subfield/discipline feed
       # pages reflect the papers just ingested, instead of waiting for their TTL.
       # Best-effort: never fails the ingest job. No-op until the three secrets
