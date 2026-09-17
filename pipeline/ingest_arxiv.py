@@ -52,7 +52,7 @@ def main():
         try:
             arxiv_categories = paper.get("arxiv_categories", [])
 
-            paper_id = upsert_paper(client, paper)
+            paper_id, _inserted = upsert_paper(client, paper)  # (paper_id, inserted) since capture-drain-ingest
             if paper_id:
                 saved += 1
 

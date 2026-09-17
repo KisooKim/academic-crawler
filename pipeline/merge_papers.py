@@ -493,12 +493,12 @@ def merge(conn, loser: str, winner: str, reason: str | None, dry: bool = False) 
     if not row:
         raise SystemExit(f"[abort] winner {winner} does not exist in papers")
     winner_in_scope = row[1]
-    cur.execute(f"SELECT doi, openalex_id, arxiv_id, {IN_SCOPE} FROM papers p WHERE p.id = %s",
+    cur.execute(f"SELECT doi, openalex_id, arxiv_id, {IN_SCOPE}, vetted FROM papers p WHERE p.id = %s",
                 [loser])
     row = cur.fetchone()
     if not row:
         raise SystemExit(f"[abort] loser {loser} does not exist in papers")
-    loser_doi, loser_oa, loser_arxiv, loser_in_scope = row
+    loser_doi, loser_oa, loser_arxiv, loser_in_scope, loser_vetted = row
 
     # OQ-2 / G-041: the merge leaves a 308 behind, so the winner must actually be reachable.
     # An in-scope loser merged into an out-of-scope winner would redirect every old URL into a
@@ -606,6 +606,15 @@ def merge(conn, loser: str, winner: str, reason: str | None, dry: bool = False) 
     # `doi` is deliberately NOT adopted: it is the paper's public URL identity — makePaperSlug(doi,
     # id) would flip the winner's canonical URL from its UUID to the loser's DOI path. The redirect
     # row's old_doi already covers that case, and the app's read path resolves it with a 308.
+    # `vetted` is a disjunction, never a downgrade: the winner keeps its own true, and takes the
+    # loser's (ledger task capture-drain-ingest, design item 10). `vetted` means "a writer
+    # confirmed this work exists" (docs/ledger/navigation-scope.md), a fact that survives the
+    # merge — and a merge that cleared it would take the surviving paper's page away.
+    if loser_vetted:
+        cur.execute("UPDATE papers SET vetted = true WHERE id = %s AND NOT vetted", [winner])
+        if cur.rowcount:
+            print(f"  [vetted]  winner {winner} takes the loser's vetted = true")
+
     adopted = {}
     for col, val in (("openalex_id", loser_oa), ("arxiv_id", loser_arxiv)):
         if not val:

@@ -178,14 +178,59 @@ def build_fill_empty_set_clause(cols: list[str]) -> str:
     return ", ".join(f"{c} = COALESCE(NULLIF({c}, ''), NULLIF(%s, ''))" for c in cols)
 
 
-def upsert_paper(conn, paper: dict) -> str | None:
+# The versionless arXiv lookup (ledger task capture-drain-ingest, design item 3). papers.arxiv_id
+# is stored version-suffixed by the crawler and VERSIONLESS by the drain, so an equality match on
+# the stored string would make `2409.01234` and `2409.01234v2` two rows for one paper. Both sides
+# are stripped; idx_papers_arxiv_id_base (migration 047) is the index that backs it. 234 groups on
+# production already hold more than one row (one per version); among them the HIGHEST version
+# suffix wins, so an incoming record lands on the newest row rather than an arbitrary one. The
+# duplicates themselves are reported by pipeline/rehearse_051.py, not merged here.
+ARXIV_BASE_MATCH_SQL = """
+    SELECT id FROM papers
+     WHERE arxiv_id IS NOT NULL
+       AND regexp_replace(arxiv_id, 'v[0-9]+$', '') = regexp_replace(%s, 'v[0-9]+$', '')
+     ORDER BY coalesce(substring(arxiv_id from 'v([0-9]+)$')::int, 0) DESC, id
+     LIMIT 1
+"""
+
+
+def _match_existing(conn, paper: dict):
+    """The `papers` dedup lookups, in precedence order: openalex_id, doi, the versionless arXiv
+    id, then the exact arXiv id. Returns the matched row dict, or None."""
+    if paper.get("openalex_id"):
+        row = execute_one(conn, "SELECT id FROM papers WHERE openalex_id = %s", [paper["openalex_id"]])
+        if row:
+            return row
+
+    if paper.get("doi"):
+        row = execute_one(
+            conn,
+            "SELECT id FROM papers WHERE normalize_doi(doi) = normalize_doi(%s)",
+            [paper["doi"]],
+        )
+        if row:
+            return row
+
+    if paper.get("arxiv_id"):
+        row = execute_one(conn, ARXIV_BASE_MATCH_SQL, [paper["arxiv_id"]])
+        if row:
+            return row
+        row = execute_one(conn, "SELECT id FROM papers WHERE arxiv_id = %s", [paper["arxiv_id"]])
+        if row:
+            return row
+
+    return None
+
+
+def upsert_paper(conn, paper: dict) -> tuple[str | None, bool]:
     """
-    Insert or update a paper. Returns paper ID if successful.
-    Deduplication is based on openalex_id, doi, or arxiv_id -- checked against `papers` first, then
-    against `paper_redirects` (a paper that was merged away must resolve to its winner, never be
-    re-created).
+    Insert or update a paper. Returns (paper_id, inserted) -- `inserted` is True only when this
+    call created the row, which is what the capture drain needs in order to link disciplines and
+    revalidate for a NEW paper and to change nothing on a matched one.
+    Deduplication is based on openalex_id, doi, or arxiv_id (the last both versionless and exact)
+    -- checked against `papers` first, then against `paper_redirects` (a paper that was merged
+    away must resolve to its winner, never be re-created).
     """
-    existing = None
 
     # The one place well-formed HTML character references are decoded, and publisher
     # extraction defects repaired, on the write path
@@ -201,18 +246,7 @@ def upsert_paper(conn, paper: dict) -> str | None:
     if paper.get("doi"):
         paper["doi"] = clean_doi(paper["doi"])
 
-    if paper.get("openalex_id"):
-        existing = execute_one(conn, "SELECT id FROM papers WHERE openalex_id = %s", [paper["openalex_id"]])
-
-    if not existing and paper.get("doi"):
-        existing = execute_one(
-            conn,
-            "SELECT id FROM papers WHERE normalize_doi(doi) = normalize_doi(%s)",
-            [paper["doi"]],
-        )
-
-    if not existing and paper.get("arxiv_id"):
-        existing = execute_one(conn, "SELECT id FROM papers WHERE arxiv_id = %s", [paper["arxiv_id"]])
+    existing = _match_existing(conn, paper)
 
     if not existing:
         winner = _redirect_winner(conn, paper)
@@ -232,7 +266,7 @@ def upsert_paper(conn, paper: dict) -> str | None:
                 set_clause = build_fill_empty_set_clause(fill)
                 execute_write(conn, f"UPDATE papers SET {set_clause} WHERE id = %s",
                               [_adapt(paper[c]) for c in fill] + [winner])
-            return winner
+            return winner, False
 
     if existing:
         # Update existing paper
@@ -251,18 +285,28 @@ def upsert_paper(conn, paper: dict) -> str | None:
             set_clause = build_update_set_clause(cols)
             values = [_adapt(paper[c]) for c in cols] + [existing["id"]]
             execute_write(conn, f"UPDATE papers SET {set_clause} WHERE id = %s", values)
-        return existing["id"]
+        return existing["id"], False
     else:
         # Insert new paper
         cols = list(paper.keys())
         placeholders = ", ".join(["%s"] * len(cols))
         col_names = ", ".join(cols)
         values = [_adapt(paper[c]) for c in cols]
-        rows = execute_write(conn, f"INSERT INTO papers ({col_names}) VALUES ({placeholders}) RETURNING id", values)
+        try:
+            rows = execute_write(conn, f"INSERT INTO papers ({col_names}) VALUES ({placeholders}) RETURNING id", values)
+        except psycopg2.errors.UniqueViolation:
+            # A concurrent writer (a crawl racing the capture drain) inserted the same
+            # openalex_id / doi / arxiv_id between the lookups above and this INSERT; each of
+            # those keys carries a unique index. execute_write has already rolled back, so one
+            # re-select answers who won. Any other integrity error is a real defect and is raised.
+            raced = _match_existing(conn, paper)
+            if raced:
+                return raced["id"], False
+            raise
         if rows:
-            return rows[0]["id"]
+            return rows[0]["id"], True
 
-    return None
+    return None, False
 
 
 def resolve_paper_ids(conn, ids) -> dict[str, str | None]:

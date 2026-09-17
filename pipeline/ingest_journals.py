@@ -14,6 +14,10 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from db import get_client, upsert_paper, link_paper_to_discipline, get_disciplines_map
 from journals_config import JOURNALS_BY_DISCIPLINE
+# The per-work half of this file now lives in ingest_work.py, so the capture drain ingests
+# under the same normalization (ledger task capture-drain-ingest, design item 2). Re-exported
+# under their old names: every existing caller and test keeps working.
+from ingest_work import is_valid_paper, normalize_openalex, reconstruct_abstract  # noqa: F401
 
 PIPELINE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=PIPELINE_DIR.parent / ".env.local")
@@ -61,96 +65,6 @@ def trigger_revalidation(saved: int) -> None:
             time.sleep(2 * attempt)
 
     raise RuntimeError(f"[Revalidate] Giving up after {attempts} attempts: {url}")
-
-
-def reconstruct_abstract(inverted_index: dict | None) -> str | None:
-    """Reconstruct abstract from OpenAlex inverted index format."""
-    if not inverted_index:
-        return None
-
-    words = []
-    for word, positions in inverted_index.items():
-        for pos in positions:
-            words.append((pos, word))
-
-    words.sort(key=lambda x: x[0])
-    return " ".join(word for _, word in words)
-
-
-def is_valid_paper(title: str, source: str | None, authors: list) -> bool:
-    """Validate that this is a real paper."""
-    if not title:
-        return False
-
-    title_lower = title.strip().lower()
-    source_lower = (source or "").strip().lower()
-
-    if source_lower and title_lower == source_lower:
-        return False
-
-    if len(title) < 20:
-        return False
-
-    if not authors or len(authors) == 0:
-        return False
-
-    if all(not a.get("name", "").strip() for a in authors):
-        return False
-
-    return True
-
-
-def normalize_openalex(work: dict) -> dict | None:
-    """Convert OpenAlex work to our paper format."""
-    title = work.get("title")
-    if not title:
-        return None
-
-    abstract = work.get("abstract") or reconstruct_abstract(work.get("abstract_inverted_index"))
-
-    authors = []
-    for authorship in work.get("authorships", [])[:10]:
-        author = authorship.get("author", {})
-        institution = ""
-        if authorship.get("institutions"):
-            institution = authorship["institutions"][0].get("display_name", "")
-
-        authors.append({
-            "name": author.get("display_name", ""),
-            "affiliation": institution,
-            "orcid": author.get("orcid"),
-            "openalex_id": author.get("id"),  # e.g. "https://openalex.org/A5023888391"
-        })
-
-    url = work.get("doi") or work.get("id")
-    pdf_url = None
-    if work.get("open_access", {}).get("oa_url"):
-        pdf_url = work["open_access"]["oa_url"]
-
-    source = None
-    source_openalex_id = None
-    primary_location = work.get("primary_location") or {}
-    if primary_location.get("source"):
-        source = primary_location["source"].get("display_name")
-        source_openalex_id = primary_location["source"].get("id")
-
-    if not is_valid_paper(title, source, authors):
-        return None
-
-    return {
-        "title": title,
-        "abstract": abstract,
-        "authors": authors,
-        "source": source,
-        "source_openalex_id": source_openalex_id,
-        "published_date": work.get("publication_date"),
-        "published_year": work.get("publication_year"),
-        "doi": work.get("doi"),
-        "url": url,
-        "pdf_url": pdf_url,
-        "openalex_id": work.get("id"),
-        "citation_count": work.get("cited_by_count", 0),
-    }
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
@@ -293,7 +207,7 @@ def main(
             discipline_id = paper.pop("_discipline_id")
             discipline_slug = paper.pop("_discipline_slug")
 
-            paper_id = upsert_paper(client, paper)
+            paper_id, _inserted = upsert_paper(client, paper)
             if paper_id:
                 saved += 1
                 link_paper_to_discipline(client, paper_id, discipline_id, source="journal")

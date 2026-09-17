@@ -336,7 +336,7 @@ def main():
 
                 # Insert into database
                 try:
-                    result = upsert_paper(conn, paper)
+                    result, _inserted = upsert_paper(conn, paper)  # (paper_id, inserted) since capture-drain-ingest
                     if result:
                         stats["papers_inserted"] += 1
                         existing_dois.add(normalized_doi)  # Add to set to prevent duplicates in same run
