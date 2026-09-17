@@ -73,7 +73,10 @@ DENORM_COUNTS = [("upvote_count", "paper_upvotes"), ("comment_count", "paper_com
 # discovery is a runtime information_schema scan — it only orders FK-less tables first.
 # 043 (T-B3) adds two, FK-less by design: `author_link_conflicts` (a log that outlives nothing it
 # needs) and the UNLOGGED `author_link_staging` (bulk resolver input). A merge re-points both.
-FK_LESS_ALLOWLIST: set[str] = {"author_link_conflicts", "author_link_staging"}
+# `author_link_moves` (050) logs provisional-author link moves by (author_id, paper_id) with no FK to
+# papers; the generic pass moves a loser's entries to the winner and drops one that collides on the
+# primary key (the winner already has an entry for that author).
+FK_LESS_ALLOWLIST: set[str] = {"author_link_conflicts", "author_link_moves", "author_link_staging"}
 
 # Child tables of `library_items` (keyed by library_item_id, not paper_id, so the paper_id
 # scan never sees them). The bespoke handler re-points them explicitly. A child table found
