@@ -8,8 +8,10 @@ import psycopg2.extras
 from dotenv import load_dotenv
 
 try:  # consumers that put pipeline/ on sys.path (every pipeline script)
+    from author_names import merge_author_elements
     from text_norm import decode_refs, normalize_text
 except ImportError:  # consumers that import this as a package (classifier/manual_label/app.py)
+    from pipeline.author_names import merge_author_elements
     from pipeline.text_norm import decode_refs, normalize_text
 
 load_dotenv()
@@ -234,6 +236,16 @@ def upsert_paper(conn, paper: dict) -> str | None:
 
     if existing:
         # Update existing paper
+        if "authors" in paper:
+            # A re-crawl must not strip author IDs a later pass wrote into the stored elements
+            # (the arXiv crawler sends names only). merge_author_elements() copies openalex_id /
+            # orcid / affiliation from the stored element only where the incoming element lacks
+            # the key; when the result equals the stored list, the link trigger does not fire.
+            # Not guarded against a write landing between this read and the UPDATE below
+            # (docs/ledger/author-elements-merge-guard.md).
+            stored = execute_one(conn, "SELECT authors FROM papers WHERE id = %s", [existing["id"]])
+            paper["authors"] = merge_author_elements(stored["authors"] if stored else None,
+                                                     paper["authors"])
         cols = [k for k in paper.keys() if k != "id"]
         if cols:
             set_clause = build_update_set_clause(cols)
