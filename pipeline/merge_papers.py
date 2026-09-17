@@ -71,7 +71,9 @@ DENORM_COUNTS = [("upvote_count", "paper_upvotes"), ("comment_count", "paper_com
 # EMPTY since 038_paper_identity.sql restored the FKs on summaries + user_saved_papers
 # (validated 2026-07-07, 0 orphans). Merge correctness does not depend on this set — table
 # discovery is a runtime information_schema scan — it only orders FK-less tables first.
-FK_LESS_ALLOWLIST: set[str] = set()
+# 043 (T-B3) adds two, FK-less by design: `author_link_conflicts` (a log that outlives nothing it
+# needs) and the UNLOGGED `author_link_staging` (bulk resolver input). A merge re-points both.
+FK_LESS_ALLOWLIST: set[str] = {"author_link_conflicts", "author_link_staging"}
 
 # Child tables of `library_items` (keyed by library_item_id, not paper_id, so the paper_id
 # scan never sees them). The bespoke handler re-points them explicitly. A child table found
@@ -123,7 +125,10 @@ IN_SCOPE = ("EXISTS (SELECT 1 FROM paper_disciplines pd JOIN disciplines d "
 
 # Never re-point these: snapshots and the redirect table itself.
 def _excluded(t: str) -> bool:
-    return "_bak" in t or t == "paper_redirects"
+    # Snapshot tables are frozen copies, never merge targets. `_bak` was the 07-07 naming; the
+    # 07-18 retire snapshots (`paper_tags_retirebak_*`) and the B4c `_b4c_nonarticle_backup`
+    # slipped past it and turned audit_paper_refs red (found 2026-09-16, T-B3 rehearsal).
+    return "_bak" in t or "bak_" in t or t.endswith("_backup") or t == "paper_redirects"
 
 
 def paper_fk_actions(cur) -> dict[str, str]:
