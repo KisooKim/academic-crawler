@@ -15,6 +15,24 @@ import unicodedata
 
 CARRIED_KEYS = ("openalex_id", "orcid", "affiliation")
 
+# Letters NFKD's canonical decomposition leaves whole (no base+combining-mark split exists for
+# them), so the existing combining-mark removal never touches them, plus a Cyrillic table applied
+# after NFKD, at which point й and ё have already arrived as и and е (their own NFKD decomposition
+# strips the combining breve/diaeresis the same way any other combining mark is stripped). A
+# matching aid, not a transliteration standard: ъ and ь are dropped rather than romanized, and кс/х
+# are not disambiguated from ks/kh collisions.
+_FOLD_MAP = {
+    "ß": "ss", "ø": "o", "æ": "ae", "œ": "oe", "ł": "l", "ı": "i",
+    "đ": "d", "ð": "d", "þ": "th", "ħ": "h",
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
+    "ж": "zh", "з": "z", "и": "i", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t",
+    "у": "u", "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh",
+    "щ": "shch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu",
+    "я": "ya", "і": "i", "є": "e", "ґ": "g",
+}
+_FOLD_TABLE = str.maketrans(_FOLD_MAP)
+
 
 def norm_name(s: str | None) -> str:
     """Lowercase, accents and punctuation removed, 'Last, First' turned to 'First Last'."""
@@ -26,13 +44,15 @@ def norm_name(s: str | None) -> str:
         s = f"{first} {last}"
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
-    s = re.sub(r"[^\w\s]", " ", s.lower())
+    s = s.lower().translate(_FOLD_TABLE)
+    s = re.sub(r"[^\w\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
 def name_agreement(stored: str, display: str | None, raw: str | None) -> str:
-    """'exact': equal after norm_name to the display or raw name; 'initials': same last token and
-    same first letter (e.g. 'W. J. Percival' vs 'Will J. Percival'); else 'mismatch'."""
+    """'exact': equal after norm_name to the display or raw name; 'variant': the same tokens in a
+    different order, or equal once spaces are removed (e.g. a split surname); 'initials': same last
+    token and same first letter (e.g. 'W. J. Percival' vs 'Will J. Percival'); else 'mismatch'."""
     a = norm_name(stored)
     cands = [c for c in (norm_name(display), norm_name(raw)) if c]
     if not a or not cands:
@@ -40,6 +60,13 @@ def name_agreement(stored: str, display: str | None, raw: str | None) -> str:
     if a in cands:
         return "exact"
     at = a.split()
+    a_joined = a.replace(" ", "")
+    for c in cands:
+        ct = c.split()
+        if at and ct and sorted(at) == sorted(ct):
+            return "variant"
+        if a_joined and a_joined == c.replace(" ", ""):
+            return "variant"
     for c in cands:
         ct = c.split()
         if at and ct and at[-1] == ct[-1] and at[0][0] == ct[0][0]:

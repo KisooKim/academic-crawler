@@ -210,7 +210,7 @@ class Plan:
 
 
 POSITION_COUNTS = ("given_id", "no_id", "name_mismatch", "duplicate_id", "has_id", "exact", "initials",
-                   "orcid", "affiliation", "orcid_dropped")
+                   "variant", "orcid", "affiliation", "orcid_dropped")
 
 
 def candidate_orcids(work: dict) -> set[str]:
@@ -1051,7 +1051,7 @@ def run_forward(store, client: OpenAlexClient, a, log=log_print) -> tuple[int, d
                             for key in ("no_id", "name_mismatch", "duplicate_id", "has_id"):
                                 rep["positions"][key] += plan.counts[key]
                         if outcome == "updated":
-                            for key in ("given_id", "exact", "initials", "orcid", "affiliation", "orcid_dropped"):
+                            for key in ("given_id", "exact", "initials", "variant", "orcid", "affiliation", "orcid_dropped"):
                                 rep["positions"][key] += plan.counts[key]
                             rep["orcid_dropped_pairs"].extend({"paper_id": pid, **d} for d in plan.orcid_dropped)
                             line["before"] = p["authors"]
