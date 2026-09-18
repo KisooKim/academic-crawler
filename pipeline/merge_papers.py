@@ -48,6 +48,7 @@ prod-shaped runs with the table and the column absent).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -203,8 +204,24 @@ def collision_keys(cur, table: str) -> list[list[str]]:
     return [r[0] for r in cur.fetchall() if "paper_id" in r[0]]
 
 
+def pick_page_edits(w_val, l_val, keep):
+    """Pass (4c)'s choice of `reading_state.page_edits` when both rows exist (052;
+    docs/library/READER_PAGE_EDIT_DESIGN.md section 1, "Corpus merge", and L11(b)): the value whose
+    `file_id` is `keep`, the primary file (4b) kept, with the winner's first when both are; else
+    the winner's value; else the loser's. No kept file matches nothing."""
+    def on_keep(val) -> bool:
+        return (keep is not None and isinstance(val, dict) and val.get("file_id") is not None
+                and str(val["file_id"]).lower() == str(keep).lower())
+    if on_keep(w_val):
+        return w_val
+    if on_keep(l_val):
+        return l_val
+    return w_val if w_val is not None else l_val
+
+
 def _merge_library_user(cur, user: str, loser: str, winner: str, *,
-                        collections: bool = False, merged_into: bool = False) -> dict[str, int]:
+                        collections: bool = False, merged_into: bool = False,
+                        page_edits: bool | None = None) -> dict[str, int]:
     """One user's library rows, loser paper -> winner paper. See module header for why this
     cannot use the generic delete-colliding policy.
 
@@ -220,12 +237,13 @@ def _merge_library_user(cur, user: str, loser: str, winner: str, *,
     l_row = cur.fetchone()   # UNIQUE ⇒ at most 1
     cur.execute(f"SELECT {cols} FROM library_items WHERE user_id = %s AND paper_id = %s", [user, winner])
     w_row = cur.fetchone()
-    return _fold_library_rows(cur, user, l_row, w_row, winner, v,
-                              collections=collections, merged_into=merged_into)
+    return _fold_library_rows(cur, user, l_row, w_row, winner, v, collections=collections,
+                              merged_into=merged_into, page_edits=page_edits)
 
 
 def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None, v: int, *,
-                       collections: bool = False, merged_into: bool = False) -> dict[str, int]:
+                       collections: bool = False, merged_into: bool = False,
+                       page_edits: bool | None = None) -> dict[str, int]:
     """Steps (2)-(4e) of the per-user library merge, on rows the caller has already read AFTER
     taking the user's counter lock (BUMP_SQL). Two callers: `_merge_library_user` (corpus merge —
     loser and winner rows are both paper-backed) and `pipeline/drain_capture_queue.py` (W-E3
@@ -234,7 +252,8 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
 
     `l_row` / `w_row` are `(id, deleted_at IS NULL, starred, read_status, memo, added_at,
     ext_meta)` tuples (`w_row` may be None); `winner_paper_id` is the `papers.id` the surviving
-    row points at; `v` is the already-bumped version. A surviving row that points at a corpus
+    row points at; `v` is the already-bumped version. `page_edits` is the 052 capability flag
+    (None = probe it in (4c)). A surviving row that points at a corpus
     paper never carries `ext_meta` (039: NULL when paper_id is set), so step (3) clears it on the
     re-point and step (4) never copies an external row's `ext_meta` onto the winner. Both are
     no-ops for the corpus merge, whose rows carry `ext_meta = NULL` already."""
@@ -316,14 +335,26 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
 
     # (4c) reading_state: PK (user_id, library_item_id) DOES collide. Most-recently-updated wins
     # — NOT the furthest page: a user who restarted the paper on the winner copy must not have
-    # their fresh position clobbered by a stale page-40 bookmark on the loser copy. There is no
-    # deleted_at on this table, so the folded-away row is hard-deleted; that is safe precisely
-    # because the client drops it via the parent item's tombstone (orphan sweep).
-    cur.execute("SELECT page, scroll_frac, updated_at FROM reading_state "
+    # their fresh position clobbered by a stale page-40 bookmark on the loser copy. A row with no
+    # page ranks below any row with one, whatever its updated_at (READER_PAGE_EDIT_DESIGN L11(a)):
+    # a page-edits-only first write INSERTs a row with page NULL and updated_at = now(), and it
+    # must never carry a null position onto the winner. There is no deleted_at on this table, so
+    # the folded-away row is hard-deleted; that is safe precisely because the client drops it via
+    # the parent item's tombstone (orphan sweep).
+    #
+    # page_edits (052): its own UPDATE, run whenever both rows exist and independent of the
+    # position comparison, before the loser row is deleted. It keeps the value whose file_id is the
+    # primary file (4b) kept, else the winner's, else the loser's (`pick_page_edits`). Guarded by
+    # has_column so a merge before 052 is applied still runs; probed here when the caller did not
+    # (drain_capture_queue.py calls this function without the flag).
+    if page_edits is None:
+        page_edits = has_column(cur, "reading_state", "page_edits")
+    rs_cols = "page, scroll_frac, updated_at" + (", page_edits" if page_edits else "")
+    cur.execute(f"SELECT {rs_cols} FROM reading_state "
                 "WHERE user_id = %s AND library_item_id = %s", [user, l_id])
     rl = cur.fetchone()
     if rl:
-        cur.execute("SELECT updated_at FROM reading_state WHERE user_id = %s AND library_item_id = %s",
+        cur.execute(f"SELECT {rs_cols} FROM reading_state WHERE user_id = %s AND library_item_id = %s",
                     [user, w_id])
         rw = cur.fetchone()
         if rw is None:
@@ -331,12 +362,20 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
                         "WHERE user_id = %s AND library_item_id = %s", [w_id, v, user, l_id])
             out["reading_state_moved"] = 1
         else:
-            if rl[2] > rw[0]:      # loser copy is the fresher read
+            # loser copy is the fresher read, and a real position
+            if rl[0] is not None and (rw[0] is None or rl[2] > rw[2]):
                 cur.execute("""UPDATE reading_state SET page = %s, scroll_frac = %s,
                                       updated_at = %s, version = %s
                                 WHERE user_id = %s AND library_item_id = %s""",
                             [rl[0], rl[1], rl[2], v, user, w_id])
                 out["reading_state_moved"] = 1
+            if page_edits:
+                # `version` only, never `updated_at`: the (4r) reason, and updated_at is what the
+                # position comparison above reads.
+                pick = pick_page_edits(rw[3], rl[3], keep)
+                cur.execute("UPDATE reading_state SET page_edits = %s::jsonb, version = %s "
+                            "WHERE user_id = %s AND library_item_id = %s",
+                            [None if pick is None else json.dumps(pick), v, user, w_id])
             cur.execute("DELETE FROM reading_state WHERE user_id = %s AND library_item_id = %s",
                         [user, l_id])
 
@@ -464,14 +503,15 @@ def merge_library_items(cur, loser: str, winner: str) -> dict[str, int]:
     # hand-patched environment must degrade to a no-op rather than to an aborted merge.
     collections = has_table(cur, "public.library_collection_items")
     merged_into = has_column(cur, "library_items", "merged_into")
+    page_edits = has_column(cur, "reading_state", "page_edits")   # 052
 
     cur.execute("SELECT DISTINCT user_id FROM library_items WHERE paper_id = %s ORDER BY user_id",
                 [loser])
     users = [r[0] for r in cur.fetchall()]
     total: dict[str, int] = {"users": len(users)}
     for u in users:
-        merged = _merge_library_user(cur, u, loser, winner,
-                                     collections=collections, merged_into=merged_into)
+        merged = _merge_library_user(cur, u, loser, winner, collections=collections,
+                                     merged_into=merged_into, page_edits=page_edits)
         for k, n in merged.items():
             total[k] = total.get(k, 0) + n
     return total
