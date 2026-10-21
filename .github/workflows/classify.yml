@@ -10,6 +10,18 @@ on:
         required: false
         default: ''
         type: string
+      embed_limit:
+        description: 'Max papers to embed for the taste profile (default 5000; the backfill chunk)'
+        required: false
+        default: ''
+        type: string
+
+# One classify run at a time: a backfill dispatch queues behind the daily run (and vice versa)
+# instead of embedding the same newest papers twice. cancel-in-progress is false because
+# cancelling mid-batch is worse than queueing.
+concurrency:
+  group: classify
+  cancel-in-progress: false
 
 jobs:
   classify:
@@ -92,6 +104,29 @@ jobs:
         working-directory: pipeline
         run: python classify_new_papers.py ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
         continue-on-error: true
+
+      # Taste profile (LiterView ledger task taste-pipeline): embed navigable papers that have no
+      # paper_embeddings row yet, newest first, at most embed_limit (5000 on the schedule). Prints a
+      # notice and exits 0 while migration 060 is absent. A failure warns and never fails the job
+      # (L4): the next run picks up whatever this one left, because the selection is "no row yet".
+      - name: Embed new papers (taste)
+        id: embed
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python embed_new_papers.py --limit ${{ inputs.embed_limit || '5000' }}
+        continue-on-error: true
+
+      - name: Warn if taste embedding failed (email)
+        if: ${{ always() && steps.embed.outcome == 'failure' }}
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "LiterView taste embedding step FAILED" \
+            --body "classify.yml: embed_new_papers.py failed, so today's new papers have no taste vector yet; the next run retries them. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       # The student step is continue-on-error so the keyword fallback still runs
       # if it dies — but a silent student failure means that day's papers get the

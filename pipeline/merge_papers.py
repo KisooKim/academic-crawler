@@ -520,6 +520,24 @@ def merge_library_items(cur, loser: str, winner: str) -> dict[str, int]:
 # table -> handler(cur, loser, winner). The generic pass skips these.
 BESPOKE_MERGERS = {"library_items": merge_library_items}
 
+# The taste tables of migration 060 the generic pass leaves alone (contracts v1.2, "Paper merges"
+# and "Negatives"; ledger task taste-pipeline item 5). `taste_negatives` gets its own pass below
+# (a version is a frozen id list, so the loser's id becomes the winner's, and a version that
+# already holds the winner drops the duplicate); `taste_cards` is rebuilt weekly and
+# `paper_embeddings` is re-embedded for a winner that lacks a vector by the daily job, so the
+# loser's rows of both go with the loser's cascade. `taste_events` and `feed_impressions` are NOT
+# here: surrogate keys, so the generic pass re-points them with a plain UPDATE.
+TASTE_NOT_GENERIC = {"taste_negatives", "taste_cards", "paper_embeddings"}
+
+
+def merge_taste_negatives(cur, loser: str, winner: str) -> dict[str, int]:
+    cur.execute("DELETE FROM taste_negatives l WHERE l.paper_id = %s AND EXISTS "
+                "(SELECT 1 FROM taste_negatives w WHERE w.paper_id = %s AND w.version = l.version)",
+                [loser, winner])
+    dropped = cur.rowcount
+    cur.execute("UPDATE taste_negatives SET paper_id = %s WHERE paper_id = %s", [winner, loser])
+    return {"moved": cur.rowcount, "dropped_as_duplicate": dropped}
+
 
 def merge(conn, loser: str, winner: str, reason: str | None, dry: bool = False) -> dict:
     cur = conn.cursor()
@@ -573,7 +591,16 @@ def merge(conn, loser: str, winner: str, reason: str | None, dry: bool = False) 
     # no DB-side protection are already consistent.
     ordered = sorted(tables, key=lambda t: (t not in FK_LESS_ALLOWLIST, t))
 
+    # Taste negatives before the generic pass (contracts v1.2); taste_cards and paper_embeddings
+    # are skipped by it (TASTE_NOT_GENERIC).
+    if "taste_negatives" in tables:
+        s = merge_taste_negatives(cur, loser, winner)
+        if any(s.values()):
+            stats["taste_negatives"] = s
+
     for t in ordered:
+        if t in TASTE_NOT_GENERIC:
+            continue
         if t in BESPOKE_MERGERS:
             s = BESPOKE_MERGERS[t](cur, loser, winner)
             if any(v for k, v in s.items() if k != "users"):
