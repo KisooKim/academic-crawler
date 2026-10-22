@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from db import get_client, execute, execute_write, upsert_paper, link_paper_to_discipline, get_disciplines_map
 from journals_config import JOURNAL_ISSNS, JOURNALS_BY_DISCIPLINE
+from text_norm import is_truncated_preview
 
 OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", os.environ.get("CROSSREF_EMAIL", ""))
 
@@ -71,7 +72,9 @@ def fetch_abstract_from_openalex(doi: str) -> str | None:
         if resp.status_code != 200:
             return None
         work = resp.json()
-        return work.get("abstract") or reconstruct_abstract(work.get("abstract_inverted_index"))
+        abstract = work.get("abstract") or reconstruct_abstract(work.get("abstract_inverted_index"))
+        # A publisher preview is not an abstract (text_norm.py).
+        return None if is_truncated_preview(abstract) else abstract
     except Exception:
         return None
 

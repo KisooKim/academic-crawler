@@ -28,8 +28,10 @@ import re
 
 try:  # consumers that put pipeline/ on sys.path (every pipeline script)
     from journals_config import JOURNALS_BY_DISCIPLINE
+    from text_norm import is_truncated_preview
 except ImportError:  # consumers that import this as a package
     from pipeline.journals_config import JOURNALS_BY_DISCIPLINE
+    from pipeline.text_norm import is_truncated_preview
 
 SOURCES = ("openalex", "crossref", "arxiv")
 
@@ -107,6 +109,10 @@ def normalize_openalex(work: dict) -> dict | None:
         return None
 
     abstract = work.get("abstract") or reconstruct_abstract(work.get("abstract_inverted_index"))
+    # A publisher preview is not an abstract. None keeps a stored abstract on a re-crawl
+    # (upsert_paper's COALESCE) and leaves a new row in the recovery queue.
+    if is_truncated_preview(abstract):
+        abstract = None
 
     authors = []
     for authorship in work.get("authorships", [])[:10]:

@@ -103,3 +103,25 @@ def normalize_text(s: str) -> str:
     s = _LIG_SPLIT_WORD.sub(lambda m: LIGATURES[m.group(1)], s)
     s = _LIG_ANY.sub(lambda m: LIGATURES[m.group(0)], s)
     return s
+
+
+# --- Publisher previews posing as abstracts, measured against the live corpus 2026-10-22 ---
+#
+# Atypon publishers (Taylor & Francis 10.1080, Academy of Management 10.5465) put a 200-character
+# preview in <meta name="dc.Description">: the opening of the abstract, or of the body when the
+# item has none (a book review, an editorial), cut and ended with "...". OpenAlex and Semantic
+# Scholar ingest that meta as the abstract, and so did cdp_drain's meta fallback. Of 195,880
+# papers, 1,079 stored one: 1,078 exactly 200 characters, one Elsevier row at 201; none came from
+# CrossRef. PREVIEW_SQL is the same test for queries.
+PREVIEW_MAX_LEN = 205
+PREVIEW_SQL = (r"(length(regexp_replace(abstract, '^\s+|\s+$', '', 'g')) <= 205"
+               r" AND abstract ~ '(\.\.\.|…)\s*$')")
+
+
+def is_truncated_preview(s: str | None) -> bool:
+    """True when `s` is a publisher preview, not an abstract: at most 205 characters once
+    stripped, ending in "..." or "…". `None` and empty strings are not previews."""
+    if not s:
+        return False
+    t = s.strip()
+    return len(t) <= PREVIEW_MAX_LEN and (t.endswith("...") or t.endswith("…"))

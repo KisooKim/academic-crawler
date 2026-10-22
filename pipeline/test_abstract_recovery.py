@@ -99,6 +99,16 @@ check("unparseable body skips the chunk", out == {} and calls == 1)
 out, calls = run(ONE_CHUNK, [_Resp(500)], ["k1"])
 check("500 skips the chunk", out == {} and calls == 1)
 
+# ── is_valid_abstract: publisher previews (2026-10-22) ───────────────────────
+ok, why = ar.is_valid_abstract("x" * 197 + "...", None)
+check("200-char preview ending ... is refused", not ok and why == "truncated_preview")
+ok, why = ar.is_valid_abstract("y" * 150 + "…", None)
+check("preview ending in a unicode ellipsis is refused", not ok and why == "truncated_preview")
+ok, _ = ar.is_valid_abstract("z" * 400 + " ...", None)
+check("a long abstract ending in ... is kept", ok)
+ok, _ = ar.is_valid_abstract("w" * 200 + ".", None)
+check("a 201-char abstract ending in a period is kept", ok)
+
 # ── summary ──────────────────────────────────────────────────────────────────
 print()
 if _failures:

@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from db import get_client, upsert_paper, link_paper_to_discipline, link_paper_to_tag, get_disciplines_map, get_tags_map
+from text_norm import is_truncated_preview
 
 load_dotenv()
 
@@ -425,6 +426,8 @@ def normalize_openalex(work: dict) -> dict | None:
 
     # Extract abstract from inverted index
     abstract = work.get("abstract") or reconstruct_abstract(work.get("abstract_inverted_index"))
+    if is_truncated_preview(abstract):  # a publisher preview, not an abstract (text_norm.py)
+        abstract = None
 
     # Extract authors
     authors = []

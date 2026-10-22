@@ -31,6 +31,7 @@ import httpx
 import requests
 
 from db import execute_write, resolve_paper_ids
+from text_norm import is_truncated_preview
 
 # ── DOI prefixes that sit behind Cloudflare and need the Home CDP drain ──────
 # (from LiterView run_l5_unified PUBLISHERS). Nature/Springer (10.1038/10.1007)
@@ -110,6 +111,8 @@ def is_valid_abstract(text: str | None, title: str | None = None) -> tuple[bool,
         return False, f"too_short:{len(t)}"
     if len(t) > 12000:
         return False, f"too_long:{len(t)}"
+    if is_truncated_preview(t):  # S2 holds T&F/AOM 200-char dc.Description previews
+        return False, "truncated_preview"
     low = t.lower()
     for bad in ("no abstract available", "abstract not available",
                 "copyright ©", "all rights reserved"):
