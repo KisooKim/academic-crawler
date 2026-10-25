@@ -125,3 +125,112 @@ def is_truncated_preview(s: str | None) -> bool:
         return False
     t = s.strip()
     return len(t) <= PREVIEW_MAX_LEN and (t.endswith("...") or t.endswith("…"))
+
+
+# --- Book-review titles whose citation names lost their separators, measured 2026-10-25 ---
+#
+# SAGE and Wiley title a book review with the reviewed book's citation, and the citation's names
+# were JATS elements (<surname>Gehman</surname><given-names>J.</given-names>) whose tags were
+# removed with no separator before the deposit reached Crossref. Crossref, OpenAlex and our rows
+# all hold the same string ("GehmanJ.JarzabkowskiP.LangleyA.", "By David T.Buckley"); nothing on
+# our side produced it. SAGE's one corrected redeposit (10.1177/01979183251400248, "RyanL., 2023."
+# became "Ryan, L., 2023.") kept the citation and restored the separator, so these rules insert a
+# space and keep the citation.
+#
+# Every rule is anchored on an initial (a capital and a period, or a bare capital between two
+# glued words), because a name glued to an initial is the one form ordinary prose does not take:
+#   given-first   "ReasonP.DeutscherColumbia" -> "Reason P. Deutscher Columbia" (Wiley: title,
+#                 initials, surname and publisher in one run)
+#   bare initial  "FrantzEKendall-TaylorA" -> "Frantz E Kendall-Taylor A"
+#   left glue     "GehmanJ.", "CastañedaE." -> "Gehman J.", "Castañeda E."
+#   right glue    "T.Buckley", "C.2024", "S.(eds)", "B.van" -> "T. Buckley", "C. 2024", ...
+# A full given name glued to a surname ("NicoleMellow", "SharmaAmogh Dhar") has no initial to
+# anchor on; name_split.py splits it with a name dictionary, which keeps "McLean",
+# "PublicAffairs" and "MeToo" whole, and clean_title() runs it last
+# (docs/ledger/reports/review-title-fullname/).
+#
+# The rules run only on a title that reads as a citation (a page count, an ISBN, an edited-by
+# marker, a review heading, or a year with a publisher word), which keeps "EffectLiteR." (an R
+# package) and "D.R.Congo" as they are. Against the 196,365 titles in production on 2026-10-25
+# they change 325 rows, every change was read, and none is a false positive.
+
+_LOWER = "a-zß-öø-ÿ"
+_GIVEN_FIRST = re.compile(rf"([^\W\d_])((?:[A-Z]\. ?)+)([A-Z][{_LOWER}]{{3,}})(?=[A-Z][{_LOWER}])")
+_BARE_INITIAL = re.compile(rf"([^\W\d_]+)([A-Z])(?=[A-Z][{_LOWER}])")
+_LEFT_GLUE = re.compile(r"([^\W\d_]+)([A-Z]\.)")
+_RIGHT_GLUE = re.compile(
+    rf"(?<![^\W\d_])([A-Z]\.)(?=[A-Z][{_LOWER}]|\(|\d|(?:van|von|de|da|di|du|del|der|den|le|la|ten|ter) )")
+# "PhD." and its kin end in a capital and a period after lowercase letters and are not names.
+_DEGREES = {"Ph", "Ed", "Psy", "Sc", "Th", "Pharm"}
+
+_YEAR = re.compile(r"(?<!\d)(?:1[89]|20)\d{2}(?!\d)")
+_CITATION_MARK = re.compile(
+    r"\b\d{2,4}\s*(?:pp|p|pages?)\b|\b[Pp]p\.|\bISBN|\(\s*[Ee]ds?\.?\s*\)|\b[Ee]dited [Bb]y\b"
+    r"|\b(?:Book|Media) [Rr]eview\b|\bCompte [Rr]endu\b|\bReview [Ee]ssay\b")
+_PUBLISHER_MARK = re.compile(
+    r"\b(?:Press|University|Publish\w*|Routledge|Palgrave|Springer|Elgar|Macmillan|Verlag|Penguin"
+    r"|Wiley|Blackwell|Foundation|Books)\b")
+
+
+def reads_as_citation(s: str) -> bool:
+    """True when `s` carries the marks of a book citation, the only titles the name rules touch."""
+    return bool(_CITATION_MARK.search(s) or (_YEAR.search(s) and _PUBLISHER_MARK.search(s)))
+
+
+def repair_flattened_names(s: str) -> str:
+    """Insert the separators a flattened JATS name lost (see above). `None` in, `None` out.
+    Idempotent: each rule fires only where a letter touches an initial, and its output is spaced."""
+    if not s or not reads_as_citation(s):
+        return s
+
+    def given_first(m):
+        if not m.group(1).islower():
+            return m.group(0)
+        initials = re.sub(r"\.(?=[A-Z])", ". ", m.group(2)).strip()
+        return f"{m.group(1)} {initials} {m.group(3)} "
+
+    def glued(word):
+        return word[-1].islower() and word not in _DEGREES
+
+    def bare(m):
+        return f"{m.group(1)} {m.group(2)} " if glued(m.group(1)) else m.group(0)
+
+    def left(m):
+        return f"{m.group(1)} {m.group(2)}" if glued(m.group(1)) else m.group(0)
+
+    s = _GIVEN_FIRST.sub(given_first, s)
+    s = _BARE_INITIAL.sub(bare, s)
+    s = _LEFT_GLUE.sub(left, s)
+    s = _RIGHT_GLUE.sub(lambda m: m.group(1) + " ", s)
+    return s
+
+
+# Crossref keeps the deposit's pretty-printing: a newline and twenty spaces around every inline
+# tag ("in the\n                    <i>Everyday</i>\n                    :"). HTML already shows
+# one space there, so collapsing changes no rendered page, only plain-text surfaces (meta tags,
+# JSON-LD, search). What the newline replaced cannot be recovered ("<u>Syn</u>\n thesis" was one
+# word, "</i>\n :" had no space), so that is left as HTML shows it. A no-break space is kept.
+_WS_RUN = re.compile(r"[ \t\r\n]+")
+
+
+def collapse_whitespace(s: str) -> str:
+    """Collapse runs of ASCII whitespace to one space and trim the ends. `None` in, `None` out."""
+    if s is None:
+        return None
+    return _WS_RUN.sub(" ", s).strip(" ")
+
+
+def clean_title(s: str) -> str:
+    """Title-only repairs, run after normalize_text() at the write choke point: whitespace, the
+    flattened citation names anchored on an initial, then the full names (name_split.py, with the
+    name dictionary in name_parts.json). Abstracts never go through it (paragraph breaks, and no
+    abstract carried the name defect on 2026-10-25). Idempotent."""
+    try:  # imported here: name_split imports this module
+        from name_split import load_dictionary, split_glued_names
+    except ImportError:
+        from pipeline.name_split import load_dictionary, split_glued_names
+    s = repair_flattened_names(collapse_whitespace(s))
+    if not s:
+        return s
+    names, given = load_dictionary()
+    return split_glued_names(s, names, given)

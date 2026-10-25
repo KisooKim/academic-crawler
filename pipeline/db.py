@@ -9,10 +9,10 @@ from dotenv import load_dotenv
 
 try:  # consumers that put pipeline/ on sys.path (every pipeline script)
     from author_names import merge_author_elements
-    from text_norm import decode_refs, normalize_text
+    from text_norm import clean_title, decode_refs, normalize_text
 except ImportError:  # consumers that import this as a package (classifier/manual_label/app.py)
     from pipeline.author_names import merge_author_elements
-    from pipeline.text_norm import decode_refs, normalize_text
+    from pipeline.text_norm import clean_title, decode_refs, normalize_text
 
 load_dotenv()
 
@@ -240,8 +240,10 @@ def upsert_paper(conn, paper: dict) -> tuple[str | None, bool]:
     # every ingest writer funnels through upsert_paper() and decode_refs() is NOT idempotent:
     # applying it twice turns "&amp;lt;" into "<" and destroys a genuinely double-escaped
     # string. Raw publisher markup is deliberately left alone; the render path interprets it.
+    # Titles also get clean_title(): deposit whitespace and the book-review citation names
+    # whose separators the publisher's markup flattening dropped (text_norm.py, name_split.py).
     if paper.get("title"):
-        paper["title"] = normalize_text(decode_refs(paper["title"]))
+        paper["title"] = clean_title(normalize_text(decode_refs(paper["title"])))
     if paper.get("abstract"):
         paper["abstract"] = normalize_text(decode_refs(paper["abstract"]))
 
