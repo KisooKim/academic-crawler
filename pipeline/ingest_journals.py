@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from db import get_client, upsert_paper, link_paper_to_discipline, get_disciplines_map
+from db import _match_existing as db_match
 from journals_config import JOURNALS_BY_DISCIPLINE
 # The per-work half of this file now lives in ingest_work.py, so the capture drain ingests
 # under the same normalization (ledger task capture-drain-ingest, design item 2). Re-exported
@@ -121,6 +122,36 @@ def fetch_papers_by_sources(
     return papers
 
 
+def save_papers(client, papers: list[dict], historical: bool) -> tuple[int, int]:
+    """Upsert each paper and link it to its discipline; returns (saved, linked).
+
+    A paper that a --from/--to/--year run inserts is a deliberate past collection, origin
+    'backfill' (owner decision O4, DECISIONS 2026-09-17), which papers_set_use_date() dates by
+    publication on INSERT. `origin` goes into the paper only when no row matches, as the capture
+    drain does: on a match upsert_paper updates every key it is given, so a matched row keeps its
+    own. Before this, the 2026-04-16 period load went in as 'pipeline' and dated 125,860 papers of
+    2020-2025 to that day (docs/ledger/use-date-april.md).
+    """
+    saved = 0
+    linked = 0
+    for paper in papers:
+        try:
+            discipline_id = paper.pop("_discipline_id")
+            discipline_slug = paper.pop("_discipline_slug")
+
+            if historical and db_match(client, paper) is None:
+                paper["origin"] = "backfill"
+            paper_id, _inserted = upsert_paper(client, paper)
+            if paper_id:
+                saved += 1
+                link_paper_to_discipline(client, paper_id, discipline_id, source="journal")
+                linked += 1
+
+        except Exception as e:
+            print(f"[Ingest] Error saving paper: {e}")
+    return saved, linked
+
+
 def main(
     from_date: str | None = None,
     to_date: str | None = None,
@@ -133,6 +164,7 @@ def main(
     Either pass (from_date, to_date) for historical backfill, or leave them None
     to use the rolling --days window (default cron behavior).
     """
+    historical = from_date is not None
     if from_date is None:
         from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         window_desc = f"last {days} days (from {from_date})"
@@ -200,21 +232,7 @@ def main(
         return
 
     # Save to database
-    saved = 0
-    linked = 0
-    for paper in all_papers:
-        try:
-            discipline_id = paper.pop("_discipline_id")
-            discipline_slug = paper.pop("_discipline_slug")
-
-            paper_id, _inserted = upsert_paper(client, paper)
-            if paper_id:
-                saved += 1
-                link_paper_to_discipline(client, paper_id, discipline_id, source="journal")
-                linked += 1
-
-        except Exception as e:
-            print(f"[Ingest] Error saving paper: {e}")
+    saved, linked = save_papers(client, all_papers, historical)
 
     print(f"[Ingest] Saved {saved} papers to database")
     print(f"[Ingest] Linked {linked} papers to disciplines")
