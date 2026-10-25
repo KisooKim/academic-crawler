@@ -100,6 +100,58 @@ def is_valid_paper(title: str, source: str | None, authors: list) -> bool:
     return True
 
 
+# ── volume, issue and pages (migration 068) ──────────────────────────────────
+# The four `papers` columns of migration 068 (ledger task lp3-biblio-columns). A key is present
+# only when the source has a value, so a record without one never sends the column at all, and
+# PRESERVE_IF_EMPTY in db.py keeps a stored value when a re-crawl sends an empty one.
+
+BIBLIO_COLUMNS = ("volume", "issue", "first_page", "last_page")
+_PAGE_SPLIT = re.compile("[-–]")  # a hyphen or an en dash, split on the first one only
+
+
+def _biblio_value(value) -> str | None:
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def biblio_from_openalex(work: dict) -> dict:
+    """The present values of OpenAlex `biblio` (volume, issue, first_page, last_page), trimmed."""
+    biblio = work.get("biblio") or {}
+    out = {}
+    for key in BIBLIO_COLUMNS:
+        value = _biblio_value(biblio.get(key))
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def biblio_from_crossref(item: dict) -> dict:
+    """Crossref `volume` and `issue`, and `page` split on its first hyphen or en dash into
+    first_page and last_page; `article-number` becomes first_page when `page` is absent (the
+    way OpenAlex fills first_page for article-numbered journals)."""
+    out = {}
+    for key in ("volume", "issue"):
+        value = _biblio_value(item.get(key))
+        if value is not None:
+            out[key] = value
+    page = _biblio_value(item.get("page"))
+    if page is not None:
+        parts = _PAGE_SPLIT.split(page, maxsplit=1)
+        first = _biblio_value(parts[0])
+        last = _biblio_value(parts[1]) if len(parts) > 1 else None
+        if first is not None:
+            out["first_page"] = first
+        if last is not None:
+            out["last_page"] = last
+    else:
+        number = _biblio_value(item.get("article-number"))
+        if number is not None:
+            out["first_page"] = number
+    return out
+
+
 # ── normalizers ──────────────────────────────────────────────────────────────
 
 def normalize_openalex(work: dict) -> dict | None:
@@ -156,6 +208,7 @@ def normalize_openalex(work: dict) -> dict | None:
         "pdf_url": pdf_url,
         "openalex_id": work.get("id"),
         "citation_count": work.get("cited_by_count", 0),
+        **biblio_from_openalex(work),
     }
 
 
@@ -241,6 +294,7 @@ def normalize_crossref(item: dict, journal_name: str | None = None) -> dict | No
         "pdf_url": pdf_url,
         "published_date": published_date,
         "published_year": int(published_date[:4]),
+        **biblio_from_crossref(item),
     }
 
 

@@ -17,6 +17,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from db import get_client, upsert_paper, link_paper_to_discipline, link_paper_to_tag, get_disciplines_map, get_tags_map
 from text_norm import is_truncated_preview
+from ingest_work import biblio_from_openalex  # volume, issue, pages (migration 068)
 
 load_dotenv()
 
@@ -494,6 +495,7 @@ def normalize_openalex(work: dict) -> dict | None:
         "openalex_id": work.get("id"),
         "citation_count": work.get("cited_by_count", 0),
         "concept_ids": concept_ids,  # For discipline/subfield linking
+        **biblio_from_openalex(work),  # absent keys when biblio has no value
     }
 
 

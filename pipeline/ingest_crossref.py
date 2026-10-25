@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from db import get_client, execute, execute_write, upsert_paper, link_paper_to_discipline, get_disciplines_map
 from journals_config import JOURNAL_ISSNS, JOURNALS_BY_DISCIPLINE
 from text_norm import is_truncated_preview
+from ingest_work import biblio_from_crossref  # volume, issue, pages (migration 068)
 
 OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", os.environ.get("CROSSREF_EMAIL", ""))
 
@@ -230,6 +231,7 @@ def normalize_crossref_paper(item: dict, journal_name: str) -> dict | None:
         "url": url,
         "pdf_url": pdf_url,
         "published_date": published_date,
+        **biblio_from_crossref(item),  # absent keys when Crossref has no value
     }
 
 

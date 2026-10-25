@@ -21,7 +21,9 @@ load_dotenv()
 # weaker/later ingest source re-upserting a paper (e.g. abstract=None from
 # OpenAlex overwriting an abstract already recovered by the recovery cron).
 # These MUST be TEXT columns only -- the guard below uses NULLIF(%s, '').
-PRESERVE_IF_EMPTY = {"abstract", "pdf_url", "url"}
+# volume / issue / first_page / last_page (migration 068, ledger task lp3-biblio-columns) are here
+# so a re-crawl whose record lacks them never blanks a value ingest or the backfill stored.
+PRESERVE_IF_EMPTY = {"abstract", "pdf_url", "url", "volume", "issue", "first_page", "last_page"}
 
 
 def get_connection():
