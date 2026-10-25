@@ -90,8 +90,16 @@ FK_LESS_ALLOWLIST: set[str] = {"author_link_conflicts", "author_link_moves", "au
 # `paper_id = loser`); a queue row whose item the drain itself merges is resolved by the drain
 # (status `merged`) in the same transaction (pipeline/drain_capture_queue.py); and its
 # ON DELETE CASCADE covers hard-delete GC.
+#
+# `library_server_fetches` (058, a find-pdf fetch log) and the three server-only import tables of 066
+# (`library_import_links`, `library_item_source_records`, `library_item_citekeys`) joined with ledger
+# task lp3-import-tables (docs/ledger/lp3-import-tables.md): their rows follow the surviving item in
+# passes (4f) to (4i) of `_fold_library_rows`, each guarded by table existence. Before this entry every
+# merge stopped on 058's table.
 KNOWN_LIBRARY_CHILDREN: set[str] = {"annotations", "user_paper_files", "reading_state",
-                                    "library_collection_items", "library_capture_queue"}
+                                    "library_collection_items", "library_capture_queue",
+                                    "library_server_fetches", "library_import_links",
+                                    "library_item_source_records", "library_item_citekeys"}
 
 # FROZEN PROTOCOL CONSTANT — L1 spec §3. A membership row's id is derived, not chosen, so that
 # two offline clients filing the same paper into the same collection converge on ONE row. The
@@ -260,7 +268,9 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
     out = {"repointed": 0, "field_merged": 0, "tombstoned": 0,
            "annotations_moved": 0, "files_moved": 0, "reading_state_moved": 0,
            "collection_items_folded": 0, "collection_items_dropped": 0,
-           "collection_items_revived": 0, "resurrect_children_restamped": 0}
+           "collection_items_revived": 0, "resurrect_children_restamped": 0,
+           "import_links_moved": 0, "source_records_moved": 0, "source_records_dropped": 0,
+           "citekeys_moved": 0, "citekeys_dropped": 0, "server_fetches_moved": 0}
     l_id, l_live, l_star, l_read, l_memo, l_added, l_ext = l_row
     w = w_row
 
@@ -469,6 +479,12 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
         cur.execute("DELETE FROM library_collection_items WHERE library_item_id = %s", [l_id])
         out["collection_items_dropped"] += cur.rowcount
 
+    # (4f)-(4i) the server-only children (066's import tables and 058's fetch log), ledger task
+    # lp3-import-tables. None is a sync type, so no version is stamped and the resurrect case needs no
+    # re-stamp. Each pass is guarded by table existence, so a database without 066 (and the crawler's
+    # copy of this file before it is updated) behaves exactly as before.
+    _fold_server_children(cur, l_id, w_id, out)
+
     # (4d) the loser item becomes a TOMBSTONE, never a hard DELETE: the client mirror drops a row
     # only when it sees deleted_at, and a hard delete here would also CASCADE the children we
     # just re-pointed had any been missed. paper_id = NULL releases the RESTRICT FK.
@@ -487,6 +503,84 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
                     "updated_at = now() WHERE id = %s", [v, l_id])
     out["tombstoned"] += 1
     return out
+
+
+def loser_citekey_wins(w_key, l_key) -> bool:
+    """Pass (4h)'s choice when both items hold a citekey; each argument is `(origin, exported_at)`.
+    A key with `exported_at` set beats one without; between two exported keys the earlier
+    `exported_at` wins; otherwise `imported` beats `generated`; otherwise the winner's key."""
+    w_origin, w_exp = w_key
+    l_origin, l_exp = l_key
+    if (l_exp is not None) != (w_exp is not None):
+        return l_exp is not None
+    if l_exp is not None and l_exp != w_exp:
+        return l_exp < w_exp
+    if l_origin != w_origin:
+        return l_origin == "imported"
+    return False
+
+
+def _fold_server_children(cur, l_id, w_id, out: dict[str, int]) -> None:
+    """Passes (4f)-(4i) of the case-(4) fold: the loser item `l_id` folds into `w_id`
+    (docs/ledger/lp3-import-tables.md, change 2). Counts go into `out`."""
+    # (4f) library_import_links: the unique key (user_id, source, source_kind, source_id) does not
+    # involve the item, so the re-point cannot conflict. An `item` row's target is the item itself.
+    if has_table(cur, "public.library_import_links"):
+        cur.execute("UPDATE library_import_links SET library_item_id = %s, "
+                    "target_id = CASE WHEN source_kind = 'item' THEN %s ELSE target_id END, "
+                    "updated_at = now() WHERE library_item_id = %s", [w_id, w_id, l_id])
+        out["import_links_moved"] += cur.rowcount
+
+    # (4g) library_item_source_records, PK (library_item_id, source): per source, the later
+    # imported_at survives on the winner (a tie keeps the winner's). The losing row is deleted first,
+    # because the primary key rejects the re-point while the winner's row still holds the source.
+    if has_table(cur, "public.library_item_source_records"):
+        cur.execute("SELECT source, imported_at FROM library_item_source_records "
+                    "WHERE library_item_id = %s ORDER BY source", [l_id])
+        for source, l_at in cur.fetchall():
+            cur.execute("SELECT imported_at FROM library_item_source_records "
+                        "WHERE library_item_id = %s AND source = %s", [w_id, source])
+            row = cur.fetchone()
+            if row is not None and not (l_at > row[0]):
+                cur.execute("DELETE FROM library_item_source_records "
+                            "WHERE library_item_id = %s AND source = %s", [l_id, source])
+                out["source_records_dropped"] += cur.rowcount
+                continue
+            if row is not None:
+                cur.execute("DELETE FROM library_item_source_records "
+                            "WHERE library_item_id = %s AND source = %s", [w_id, source])
+                out["source_records_dropped"] += cur.rowcount
+            cur.execute("UPDATE library_item_source_records SET library_item_id = %s "
+                        "WHERE library_item_id = %s AND source = %s", [w_id, l_id, source])
+            out["source_records_moved"] += cur.rowcount
+
+    # (4h) library_item_citekeys, PK library_item_id: one key survives (`loser_citekey_wins`). The
+    # losing key is deleted first. A re-pointed key cannot collide with UNIQUE (user_id, citekey):
+    # it is the same user's existing key.
+    if has_table(cur, "public.library_item_citekeys"):
+        cur.execute("SELECT origin, exported_at FROM library_item_citekeys WHERE library_item_id = %s",
+                    [l_id])
+        l_key = cur.fetchone()
+        if l_key is not None:
+            cur.execute("SELECT origin, exported_at FROM library_item_citekeys "
+                        "WHERE library_item_id = %s", [w_id])
+            w_key = cur.fetchone()
+            if w_key is not None and not loser_citekey_wins(w_key, l_key):
+                cur.execute("DELETE FROM library_item_citekeys WHERE library_item_id = %s", [l_id])
+                out["citekeys_dropped"] += cur.rowcount
+            else:
+                if w_key is not None:
+                    cur.execute("DELETE FROM library_item_citekeys WHERE library_item_id = %s", [w_id])
+                    out["citekeys_dropped"] += cur.rowcount
+                cur.execute("UPDATE library_item_citekeys SET library_item_id = %s "
+                            "WHERE library_item_id = %s", [w_id, l_id])
+                out["citekeys_moved"] += cur.rowcount
+
+    # (4i) library_server_fetches (058): a fetch log with no unique key, a plain re-point.
+    if has_table(cur, "public.library_server_fetches"):
+        cur.execute("UPDATE library_server_fetches SET library_item_id = %s WHERE library_item_id = %s",
+                    [w_id, l_id])
+        out["server_fetches_moved"] += cur.rowcount
 
 
 def merge_library_items(cur, loser: str, winner: str) -> dict[str, int]:
@@ -546,17 +640,17 @@ def merge(conn, loser: str, winner: str, reason: str | None, dry: bool = False) 
     if loser == winner:
         raise SystemExit("[abort] loser and winner are the same id")
 
-    cur.execute(f"SELECT doi, {IN_SCOPE} FROM papers p WHERE p.id = %s", [winner])
+    cur.execute(f"SELECT doi, {IN_SCOPE}, corpus_tier FROM papers p WHERE p.id = %s", [winner])
     row = cur.fetchone()
     if not row:
         raise SystemExit(f"[abort] winner {winner} does not exist in papers")
-    winner_in_scope = row[1]
-    cur.execute(f"SELECT doi, openalex_id, arxiv_id, {IN_SCOPE}, vetted FROM papers p WHERE p.id = %s",
-                [loser])
+    winner_in_scope, winner_tier = row[1], row[2]
+    cur.execute(f"SELECT doi, openalex_id, arxiv_id, {IN_SCOPE}, vetted, corpus_tier FROM papers p "
+                "WHERE p.id = %s", [loser])
     row = cur.fetchone()
     if not row:
         raise SystemExit(f"[abort] loser {loser} does not exist in papers")
-    loser_doi, loser_oa, loser_arxiv, loser_in_scope, loser_vetted = row
+    loser_doi, loser_oa, loser_arxiv, loser_in_scope, loser_vetted, loser_tier = row
 
     # OQ-2 / G-041: the merge leaves a 308 behind, so the winner must actually be reachable.
     # An in-scope loser merged into an out-of-scope winner would redirect every old URL into a
@@ -566,6 +660,15 @@ def merge(conn, loser: str, winner: str, reason: str | None, dry: bool = False) 
         raise SystemExit(f"[abort] winner {winner} is out of scope but loser {loser} is in scope — "
                          f"the redirect would land on a 404 (A5 scope gate). Pick the in-scope "
                          f"paper as the winner, or bring the winner in scope first.")
+
+    # The tier policy (ledger task lp3-import-tables, change 2): a core loser never merges into a
+    # non-core winner. Only 'core' papers have a page and appear in search, and deduplicate.py keeps
+    # the paper with more data, so a staged capture could otherwise win over an ingested paper and
+    # leave its page redirecting to a page that does not exist.
+    if loser_tier == "core" and winner_tier != "core":
+        raise SystemExit(f"[abort] loser {loser} has corpus_tier '{loser_tier}' but winner {winner} has "
+                         f"corpus_tier '{winner_tier}' — a core paper may not merge into a non-core one. "
+                         f"Pick the core paper as the winner.")
 
     tables = referencing_tables(cur)
 
