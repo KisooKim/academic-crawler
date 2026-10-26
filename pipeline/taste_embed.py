@@ -39,9 +39,9 @@ MAX_SEQ_LENGTH = 256
 ENCODE_BATCH = 64
 WRITE_BATCH = 500
 
-# navigablePaper, copied verbatim from lib/queries.ts:29-30.
+# navigablePaper, copied verbatim from lib/queries.ts (with migration 067's core condition).
 def navigable_paper(alias: str = "p") -> str:
-    return (f"({alias}.vetted AND EXISTS (SELECT 1 FROM paper_disciplines pd JOIN disciplines d "
+    return (f"({alias}.vetted AND {alias}.corpus_tier = 'core' AND EXISTS (SELECT 1 FROM paper_disciplines pd JOIN disciplines d "
             f"ON d.id = pd.discipline_id WHERE pd.paper_id = {alias}.id AND d.in_scope))")
 
 

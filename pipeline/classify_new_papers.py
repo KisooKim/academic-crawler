@@ -52,7 +52,8 @@ def get_unclassified_papers(conn, limit: int = None) -> list:
     # so the fallback classifier never tags out-of-scope arXiv/physics papers.
     papers_rows = execute(conn, """
         SELECT p.id, p.title, p.source, p.abstract FROM papers p
-        WHERE EXISTS (SELECT 1 FROM paper_disciplines pd JOIN disciplines d
+        WHERE p.corpus_tier = 'core'
+          AND EXISTS (SELECT 1 FROM paper_disciplines pd JOIN disciplines d
                       ON d.id = pd.discipline_id
                       WHERE pd.paper_id = p.id AND d.in_scope)
     """)

@@ -587,7 +587,8 @@ class Store:
         return v
 
     def select_ids(self, sel: Selection) -> list[str]:
-        where = ["p.source = 'arXiv'", "p.created_at <= now() - make_interval(days => %s)",
+        # core rows only (migration 067): a staged paper's authors are linked on promotion
+        where = ["p.source = 'arXiv'", "p.corpus_tier = 'core'", "p.created_at <= now() - make_interval(days => %s)",
                  """EXISTS (SELECT 1 FROM author_elements(p.id, p.authors, p.published_year) e
                              WHERE e.openalex_id IS NULL)"""]
         params: list = [sel.min_age_days]

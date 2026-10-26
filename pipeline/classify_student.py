@@ -57,6 +57,7 @@ def get_untagged_papers(conn, limit):
                COALESCE(p.abstract,'') AS abstract, COALESCE(p.source,'') AS journal
         FROM papers p
         WHERE NOT EXISTS (SELECT 1 FROM paper_tags pt WHERE pt.paper_id = p.id)
+          AND p.corpus_tier = 'core'
           AND COALESCE(LENGTH(TRIM(p.abstract)), 0) >= 1
           -- Scope gate (A5): only classify in-scope papers (linked to an in-scope
           -- discipline). Stops minting new wrong tags on out-of-scope arXiv/physics.

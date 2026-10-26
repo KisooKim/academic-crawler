@@ -16,9 +16,15 @@ uses (`ingest_work.py`) and inserts through the same `upsert_paper()`. A TypeScr
 be a second normalization, and would fire the author and journal triggers with scraped strings.
 
 Invariants:
-  * `origin` and `vetted` are written ON INSERT ONLY. When `upsert_paper()` MATCHES an existing
-    row the drain links the item and changes nothing on the paper — it never lowers `vetted`,
-    never rewrites `origin`, and never touches `corpus_tier` (it keeps its default).
+  * `origin`, `vetted` and `corpus_tier` are written ON INSERT ONLY. A new row is
+    `corpus_tier = 'core'` when `source_discipline()` resolves its venue to a configured journal
+    and `'staged'` otherwise (migration 067, docs/ledger/lp3-capture-proof.md): a staged paper has
+    no page, is in no list or corpus-wide computation, and touches neither the author resolver nor
+    `journals.paper_count` until `promote_captured.py` promotes it. When `upsert_paper()` MATCHES
+    an existing row the drain links the item and changes nothing on the paper — it never lowers
+    `vetted`, never rewrites `origin`, and never changes `corpus_tier` (a staged row hit again
+    stays staged; only promote_captured.py promotes it). Writing `'staged'` needs 067's CHECK, so
+    this file must not run against a database without 067.
   * Every version bump goes through the LOCKED COUNTER — `merge_papers.BUMP_SQL`, the statement
     `lib/library/version.ts` uses — taken BEFORE any row of that user's data is touched (the same
     lock order as the app and the corpus merge). A bump that bypasses the counter can be ordered
@@ -37,7 +43,9 @@ Invariants:
 
 Status lifecycle (047): pending -> linked (re-point, ext_meta := NULL) | merged (fold +
 tombstone) | closed (the item was tombstoned first, OR the work is not an article) | failed (an
-error the drain could not classify, or 14 days without a resolution).
+error the drain could not classify, or 14 days without a resolution). `linked` covers both tiers:
+an ingested paper in an unconfigured venue is linked to the item as a staged paper, which the
+library shows as a corpus item with no page (paper-meta `public` is false).
 
 Resolution state, on the item's `ext_meta.resolution` and shown on the card (design item 7):
 resolving -> not_indexed (nothing resolved yet; OpenAlex indexes new works 2-6 days after
@@ -390,10 +398,11 @@ def trigger_revalidation(paper_id: str) -> None:
 
 def ingest_record(conn, record: dict, source: str) -> tuple[str | None, bool, str | None, dict]:
     """(paper_id, inserted, discipline_slug, the normalized paper). The record has already
-    passed would_ingest(). `origin` and `vetted` ride in the dict, so they are written by the
-    INSERT branch of upsert_paper() and by nothing else: on a match the UPDATE branch rewrites
-    only the keys present here, and a matched row's own origin/vetted are not among them —
-    they are stripped below before the call."""
+    passed would_ingest(). `origin`, `vetted` and `corpus_tier` ride in the dict only when no row
+    matches, so they are written by the INSERT branch of upsert_paper() and by nothing else: on a
+    match the UPDATE branch rewrites only the keys present here, and a matched row's own
+    origin/vetted/corpus_tier are not among them. `corpus_tier` is 'core' when the venue resolves
+    to a configured journal (a discipline slug) and 'staged' otherwise (migration 067)."""
     paper = normalize(record, source, versionless=True)
     if paper is None:
         return None, False, None, {}
@@ -407,6 +416,7 @@ def ingest_record(conn, record: dict, source: str) -> tuple[str | None, bool, st
     if existing is None:
         paper["origin"] = "user-library"
         paper["vetted"] = True
+        paper["corpus_tier"] = "core" if slug else "staged"
     paper_id, inserted = upsert_paper(conn, paper)
     return (str(paper_id) if paper_id else None), inserted, slug, card
 
