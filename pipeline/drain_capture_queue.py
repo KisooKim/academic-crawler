@@ -42,14 +42,39 @@ Invariants:
     DOIs, arXiv ids and paper ids only — never a user id, never a row, never `resolved_work`.
 
 Status lifecycle (047): pending -> linked (re-point, ext_meta := NULL) | merged (fold +
-tombstone) | closed (the item was tombstoned first, OR the work is not an article) | failed (an
-error the drain could not classify, or 14 days without a resolution). `linked` covers both tiers:
+tombstone) | closed (the item was tombstoned first, OR the work is not an article) | failed (14
+days without a resolution). `linked` covers both tiers:
 an ingested paper in an unconfigured venue is linked to the item as a staged paper, which the
 library shows as a corpus item with no page (paper-meta `public` is false).
 
 Resolution state, on the item's `ext_meta.resolution` and shown on the card (design item 7):
 resolving -> not_indexed (nothing resolved yet; OpenAlex indexes new works 2-6 days after
 publication) | incomplete (with the reason; `not_article:*` renders as "Not a paper") | resolved.
+
+Import rows (ledger task lp3-import-enqueue, design docs/library/LP3_SWITCH_DESIGN_v2.md 5.7). The
+import commit and pipeline/backfill_import_queue.py enqueue imported external items with
+`scraped.origin = 'import'`; the capture route writes `origin = 'capture'`. An import row is resolved,
+ingested, linked or folded exactly as a capture row, with two differences:
+  * Claim order (`CLAIM_ORDER`): every claimable capture row before any import row, and import rows
+    in `created_at` order, across users too (first in, first out: a second user's import waits
+    behind a first user's whole backlog; round-robin by user is the known follow-up).
+  * Logs: an import row prints no per-row line, so a public run never lists a person's library in
+    submission order. A run prints the count of import rows per outcome.
+  * Time budget: once a run has spent IMPORT_BUDGET_S seconds it claims no more import rows
+    (capture rows are still claimed up to the row limit), so a large import keeps each run well
+    inside the workflow's 20-minute timeout and a capture's dispatch never waits long behind it.
+    The run then logs how many import rows are left for the next run.
+
+A row whose processing raises (any row): its open transaction is rolled back, but what the row had
+already committed stays (upsert_paper() commits the connection, so an ingested paper and the stored
+`resolved_work` can already be in). The attempt is then recorded in its own transaction:
+`attempts + 1`, `last_attempt_at = now()`, `last_error` = the exception's class name (never its
+message, which can carry a DOI). The row stays pending, so the claim predicate's backoff skips it on
+the next runs, until it is older than FAILED_AFTER_DAYS: then it becomes `failed` and its card
+`incomplete` (not_indexed), as the expiry of a row that resolves nothing does. The run goes on with
+the next row up to its limit. The log line names the queue id and the exception class only. The
+process exits non-zero when a row raised on its first attempt (`attempts` was 0), so the workflow's
+failure mail fires once per bad row, and when the run could not claim a row or record an attempt.
 
   python pipeline/drain_capture_queue.py [--dry-run] [--limit N] [--dsn URL] [--no-network]
 
@@ -61,10 +86,13 @@ rehearsal that must not call OpenAlex.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import psycopg2
@@ -103,10 +131,30 @@ HTTP_TIMEOUT = 3.0
 CLAIM_PREDICATE = ("status = 'pending' AND (last_attempt_at IS NULL OR last_attempt_at < "
                    "now() - least(interval '24 hours', interval '30 minutes' * power(2, attempts)))")
 
-CLAIM_SQL = (f"SELECT id, library_item_id, user_id, doi, arxiv_id, resolved_work, resolved_source, "
-             f"attempts, created_at < now() - interval '{FAILED_AFTER_DAYS} days' AS expired "
-             f"FROM library_capture_queue WHERE {CLAIM_PREDICATE} AND id <> ALL(%s::uuid[]) "
-             f"ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1")
+# An import row's `scraped.origin`; capture rows carry 'capture', rows written before
+# lp3-import-enqueue carry none (and are capture rows).
+IMPORT_ORIGIN = "coalesce(scraped->>'origin', '') = 'import'"
+
+# Every claimable capture row before any import row (false sorts before true), then submission order.
+CLAIM_ORDER = "(coalesce(scraped->>'origin', '') = 'import'), created_at"
+
+_CLAIM = (f"SELECT id, library_item_id, user_id, doi, arxiv_id, resolved_work, resolved_source, "
+          f"attempts, created_at < now() - interval '{FAILED_AFTER_DAYS} days' AS expired, "
+          f"{IMPORT_ORIGIN} AS is_import "
+          f"FROM library_capture_queue WHERE {CLAIM_PREDICATE} AND id <> ALL(%s::uuid[]){{only}} "
+          f"ORDER BY {CLAIM_ORDER} FOR UPDATE SKIP LOCKED LIMIT 1")
+CLAIM_SQL = _CLAIM.format(only="")
+# After the import budget is spent: capture rows only.
+CLAIM_CAPTURES_SQL = _CLAIM.format(only=f" AND NOT ({IMPORT_ORIGIN})")
+
+# Seconds a run may spend before it stops claiming import rows (capture rows are still claimed up
+# to the row limit). drain.yml times a run out at 20 minutes.
+IMPORT_BUDGET_S = 240
+_clock = time.monotonic   # the run's clock; a test replaces it
+
+
+def _quiet(*_args, **_kwargs) -> None:
+    """The per-row logger of an import row: prints nothing (see the module docstring)."""
 
 
 def strip_arxiv_version(arxiv_id: str | None) -> str | None:
@@ -340,7 +388,7 @@ def set_card(cur, item_id: str, version: int, paper: dict) -> None:
 
 
 def link_item(cur, qid: str, item_id: str, user: str, paper: str, *,
-              collections: bool, merged_into: bool) -> str:
+              collections: bool, merged_into: bool, say=print) -> str:
     """Point the user's external row at `paper`, folding it into the row they already hold when
     there is one. BUMP FIRST (lock order). Returns 'linked' or 'merged'."""
     cur.execute(BUMP_SQL, [user])
@@ -350,15 +398,22 @@ def link_item(cur, qid: str, item_id: str, user: str, paper: str, *,
     w_row = cur.fetchone()   # UNIQUE (user_id, paper_id) => at most one
     cur.execute(f"SELECT {FOLD_COLS} FROM library_items WHERE id = %s", [item_id])
     l_row = cur.fetchone()
+    if w_row is not None and str(w_row[0]) == str(item_id):
+        # The item already points at the paper: a second drain linked it after this one's
+        # upsert_paper() committed mid-row and released the claim. Folding it into itself would
+        # delete its reading_state and memberships and tombstone it, so it is only recorded.
+        say(f"  [linked]  queue={qid} paper={paper} v={v} (already linked)")
+        _resolve(cur, qid, "linked")
+        return "linked"
 
     stats = _fold_library_rows(cur, user, l_row, w_row, paper, v,
                                collections=collections, merged_into=merged_into)
     if w_row is None:
-        print(f"  [linked]  queue={qid} paper={paper} v={v}")
+        say(f"  [linked]  queue={qid} paper={paper} v={v}")
         _resolve(cur, qid, "linked")
         return "linked"
     touched = {k: n for k, n in stats.items() if n}
-    print(f"  [merged]  queue={qid} paper={paper} into={w_row[0]} v={v} {touched}")
+    say(f"  [merged]  queue={qid} paper={paper} into={w_row[0]} v={v} {touched}")
     _resolve(cur, qid, "merged")
     return "merged"
 
@@ -376,10 +431,11 @@ def link_disciplines(cur, paper_id: str, slug: str) -> int:
     return cur.rowcount
 
 
-def trigger_revalidation(paper_id: str) -> None:
+def trigger_revalidation(paper_id: str, *, from_import: bool = False) -> None:
     """Bust the paper page's cached 404. `notFound()` for an id that did not exist yet may be
     cached, so a newly-published paper needs its own path busted; the feed routes are busted by
-    the crawl's own call at the end of each cycle. Best effort — never fails the row."""
+    the crawl's own call at the end of each cycle. Best effort — never fails the row. A paper an
+    import row inserted is not named in the warning."""
     base = os.environ.get("SITE_URL") or os.environ.get("NEXT_PUBLIC_SITE_URL")
     secret = os.environ.get("CRON_SECRET")
     if not base or not secret:
@@ -393,7 +449,8 @@ def trigger_revalidation(paper_id: str) -> None:
         httpx.post(base.rstrip("/") + "/api/revalidate", headers=headers,
                    json={"paths": [f"/paper/{paper_id}"]}, timeout=10)
     except Exception as e:  # noqa: BLE001
-        print(f"  [warn]    revalidate failed for paper={paper_id}: {e.__class__.__name__}")
+        who = "an import row's paper" if from_import else f"paper={paper_id}"
+        print(f"  [warn]    revalidate failed for {who}: {e.__class__.__name__}")
 
 
 def ingest_record(conn, record: dict, source: str) -> tuple[str | None, bool, str | None, dict]:
@@ -424,32 +481,38 @@ def ingest_record(conn, record: dict, source: str) -> tuple[str | None, bool, st
 # ── one row ──────────────────────────────────────────────────────────────────
 
 def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
-                network: bool, seen: list[str]) -> tuple[str | None, str | None]:
+                network: bool, seen: list[str], import_ids: set[str] | None = None,
+                captures_only: bool = False) -> tuple[str | None, str | None]:
     """Claim and process ONE queue row in ONE transaction. Returns (queue id, outcome); the
     queue id is None when no row was claimable, which ends the run. Raises on any error; the
-    caller owns the rollback and the `failed` stamp."""
+    caller owns the rollback and the `failed` stamp. An import row's id is added to `import_ids`
+    as soon as it is claimed, and its per-row lines are not printed."""
     cur = conn.cursor()
-    cur.execute(CLAIM_SQL, [seen])
+    cur.execute(CLAIM_CAPTURES_SQL if captures_only else CLAIM_SQL, [seen])
     row = cur.fetchone()
     if row is None:
         return None, None
-    qid, item_id, user, doi, arxiv_id, resolved_work, resolved_source, attempts, expired = row
+    (qid, item_id, user, doi, arxiv_id, resolved_work, resolved_source, attempts, expired,
+     is_import) = row
     qid, item_id, user = str(qid), str(item_id), str(user)
     seen.append(qid)
+    if is_import and import_ids is not None:
+        import_ids.add(qid)
+    say = _quiet if is_import else print
     base = strip_arxiv_version(arxiv_id)
 
     cur.execute("SELECT id, deleted_at, paper_id FROM library_items WHERE id = %s", [item_id])
     item = cur.fetchone()
     if item is None:
-        print(f"  [skip]    queue={qid} item gone")
+        say(f"  [skip]    queue={qid} item gone")
         return qid, None
     if item[1] is not None:
-        print(f"  [closed]  queue={qid} (item tombstoned before the drain ran)")
+        say(f"  [closed]  queue={qid} (item tombstoned before the drain ran)")
         if not dry_run:
             _resolve(cur, qid, "closed")
         return qid, "closed"
     if item[2] is not None:
-        print(f"  [linked]  queue={qid} paper={item[2]} (already linked)")
+        say(f"  [linked]  queue={qid} paper={item[2]} (already linked)")
         if not dry_run:
             _resolve(cur, qid, "linked")
         return qid, "linked"
@@ -468,16 +531,16 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
             cur.execute("SELECT id FROM library_items WHERE user_id = %s AND paper_id = %s",
                         [user, paper])
             outcome = "linked" if cur.fetchone() is None else "merged"
-            print(f"  [{outcome}]  queue={qid} paper={paper}")
+            say(f"  [{outcome}]  queue={qid} paper={paper}")
             return qid, outcome
         return qid, link_item(cur, qid, item_id, user, paper,
-                              collections=collections, merged_into=merged_into)
+                              collections=collections, merged_into=merged_into, say=say)
 
     # (ii) a miss with no stored record — resolve it here (the route's chain was killed, or no
     # route ran at all, as for a row created before this feature shipped)
     if resolved_work is None:
         if not network:
-            print(f"  [pending] queue={qid} doi={doi!r} arxiv={base!r} (no record; --no-network)")
+            say(f"  [pending] queue={qid} doi={doi!r} arxiv={base!r} (no record; --no-network)")
             return qid, "pending"
         resolved_work, resolved_source = resolve_work(doi, base)
         if resolved_work is not None and not dry_run:
@@ -488,7 +551,7 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
     # (iv) nothing resolved anywhere
     if resolved_work is None:
         if dry_run:
-            print(f"  [pending] queue={qid} doi={doi!r} arxiv={base!r} (no record)")
+            say(f"  [pending] queue={qid} doi={doi!r} arxiv={base!r} (no record)")
             return qid, "pending"
         cur.execute(BUMP_SQL, [user])
         v = cur.fetchone()[0]
@@ -500,38 +563,43 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
             set_resolution(cur, item_id, v, "incomplete", source="not_indexed",
                            last_attempt_at=stamp)
             _resolve(cur, qid, "failed", error=f"unresolved after {FAILED_AFTER_DAYS} days")
-            print(f"  [failed]  queue={qid} doi={doi!r} arxiv={base!r} "
-                  f"(unresolved after {FAILED_AFTER_DAYS} days)")
+            say(f"  [failed]  queue={qid} doi={doi!r} arxiv={base!r} "
+                f"(unresolved after {FAILED_AFTER_DAYS} days)")
             return qid, "failed"
         set_resolution(cur, item_id, v, "not_indexed", last_attempt_at=stamp)
-        print(f"  [pending] queue={qid} doi={doi!r} arxiv={base!r} attempts={attempts + 1}")
+        say(f"  [pending] queue={qid} doi={doi!r} arxiv={base!r} attempts={attempts + 1}")
         return qid, "pending"
 
     # (iii) a record the crawl would not have taken
     ok, reason = would_ingest(resolved_work, resolved_source)
     if not ok:
         if dry_run:
-            print(f"  [closed]  queue={qid} doi={doi!r} ({reason})")
+            say(f"  [closed]  queue={qid} doi={doi!r} ({reason})")
             return qid, "closed"
         cur.execute(BUMP_SQL, [user])
         v = cur.fetchone()[0]
         set_resolution(cur, item_id, v, "incomplete", source=reason)
         _resolve(cur, qid, "closed", error=reason)
-        print(f"  [closed]  queue={qid} doi={doi!r} ({reason})")
+        say(f"  [closed]  queue={qid} doi={doi!r} ({reason})")
         return qid, "closed"
 
     # (iii) a record the crawl WOULD have taken — ingest it
     if dry_run:
-        print(f"  [linked]  queue={qid} doi={doi!r} (would ingest from {resolved_source})")
+        say(f"  [linked]  queue={qid} doi={doi!r} (would ingest from {resolved_source})")
         return qid, "linked"
 
-    paper_id, inserted, slug, card = ingest_record(conn, resolved_work, resolved_source)
+    if is_import:
+        # db.py's upsert can print a dedup warning naming the record's DOI and arXiv id
+        with contextlib.redirect_stdout(io.StringIO()):
+            paper_id, inserted, slug, card = ingest_record(conn, resolved_work, resolved_source)
+    else:
+        paper_id, inserted, slug, card = ingest_record(conn, resolved_work, resolved_source)
     if paper_id is None:
         cur.execute(BUMP_SQL, [user])
         v = cur.fetchone()[0]
         set_resolution(cur, item_id, v, "incomplete", source="not_a_paper")
         _resolve(cur, qid, "closed", error="not_a_paper")
-        print(f"  [closed]  queue={qid} doi={doi!r} (not_a_paper on normalize)")
+        say(f"  [closed]  queue={qid} doi={doi!r} (not_a_paper on normalize)")
         return qid, "closed"
 
     linked_disc = 0
@@ -542,21 +610,51 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
     set_card(cur, item_id, v, card)
     set_resolution(cur, item_id, v, "resolved", source=resolved_source)
     outcome = link_item(cur, qid, item_id, user, paper_id,
-                        collections=collections, merged_into=merged_into)
-    print(f"  [ingest]  queue={qid} paper={paper_id} inserted={inserted} "
+                        collections=collections, merged_into=merged_into, say=say)
+    say(f"  [ingest]  queue={qid} paper={paper_id} inserted={inserted} "
           f"source={resolved_source} discipline={slug or '-'}({linked_disc})")
     if inserted:
-        _revalidate_after_commit.append(paper_id)
+        _revalidate_after_commit.append((paper_id, bool(is_import)))
     return qid, outcome
 
 
-_revalidate_after_commit: list[str] = []
+_revalidate_after_commit: list[tuple[str, bool]] = []   # (paper id, inserted by an import row)
 
 
 # ── the run ──────────────────────────────────────────────────────────────────
 
+# A row whose processing raised: one more attempt, stamped now, so CLAIM_PREDICATE's backoff skips
+# it; it stays pending until it is older than FAILED_AFTER_DAYS, then it is `failed` (resolved_at set,
+# as the expiry path's _resolve does). `last_error` holds the exception's class name only. Returns the
+# status, the attempts before this one, the item, the user and the stamp the card's resolution takes.
+RECORD_ERROR_SQL = (
+    "UPDATE library_capture_queue SET attempts = attempts + 1, last_attempt_at = now(), last_error = %s, "
+    f"status = CASE WHEN created_at < now() - interval '{FAILED_AFTER_DAYS} days' THEN 'failed' ELSE status END, "
+    f"resolved_at = CASE WHEN created_at < now() - interval '{FAILED_AFTER_DAYS} days' THEN now() ELSE resolved_at END "
+    "WHERE id = %s RETURNING status, attempts - 1, library_item_id, user_id, "
+    "to_char(last_attempt_at, 'YYYY-MM-DD\"T\"HH24:MI:SSOF')")
+
+
+def record_error(conn, qid: str, name: str) -> int:
+    """Record a raising row's attempt in its own transaction; returns the attempts before it. A row
+    past FAILED_AFTER_DAYS becomes failed and its card incomplete (not_indexed), BUMP first."""
+    cur = conn.cursor()
+    cur.execute(RECORD_ERROR_SQL, [name, qid])
+    status, before, item_id, user, stamp = cur.fetchone()
+    if status == "failed":
+        cur.execute(BUMP_SQL, [str(user)])
+        v = cur.fetchone()[0]
+        set_resolution(cur, str(item_id), v, "incomplete", source="not_indexed", last_attempt_at=stamp)
+    conn.commit()
+    return int(before)
+
+
 def run(conn, *, dry_run: bool = False, limit: int | None = None,
-        network: bool = True) -> dict[str, int]:
+        network: bool = True, outcomes: list | None = None) -> dict[str, int]:
+    """Drain up to `limit` rows; returns the count per outcome over all rows, plus `raised` (the
+    rows whose processing raised) and `alerts` (first failures, and a claim or record that failed;
+    non-zero makes the process exit 1). When `outcomes` is a list, each claimed row's (queue id,
+    outcome) is appended to it in claim order, with the outcome 'raised' for a row that raised."""
     cur = conn.cursor()
     # Capability probes, once per run. 045 and 051 are applied in production, so a missing
     # column is a mis-provisioned environment, not a supported state: abort before a row is
@@ -580,13 +678,22 @@ def run(conn, *, dry_run: bool = False, limit: int | None = None,
     conn.rollback()
 
     counts = {k: 0 for k in OUTCOMES}
+    import_counts = {k: 0 for k in OUTCOMES}
+    raised = import_raised = alerts = 0
+    import_ids: set[str] = set()
     seen: list[str] = []
     _revalidate_after_commit.clear()
+    t0 = _clock()
+    budget_spent = False
     for _ in range(cap):
         qid = None
+        n_seen = len(seen)
+        if not budget_spent and _clock() - t0 >= IMPORT_BUDGET_S:
+            budget_spent = True
         try:
             qid, outcome = process_row(conn, collections=collections, merged_into=merged_into,
-                                       dry_run=dry_run, network=network, seen=seen)
+                                       dry_run=dry_run, network=network, seen=seen,
+                                       import_ids=import_ids, captures_only=budget_spent)
             if dry_run:
                 conn.rollback()
             else:
@@ -595,27 +702,59 @@ def run(conn, *, dry_run: bool = False, limit: int | None = None,
                 break
         except Exception as e:  # noqa: BLE001 — one row's failure must not stop the run
             conn.rollback()
-            err = f"{e.__class__.__name__}: {e}"
-            print(f"  [failed]  queue={qid} {err}")
-            if qid is not None and not dry_run:
-                c2 = conn.cursor()
-                c2.execute("UPDATE library_capture_queue SET status = 'failed', last_error = %s, "
-                           "attempts = attempts + 1, last_attempt_at = now() WHERE id = %s",
-                           [err, qid])
-                conn.commit()
-            outcome = "failed" if qid is not None else None
-            if qid is None:
+            claimed = seen[-1] if len(seen) > n_seen else None
+            name = e.__class__.__name__
+            # The class name only: a message can carry a row's values (a constraint's DETAIL).
+            print(f"  [error]   queue={claimed} {name}")
+            raised += 1
+            if claimed is None:
+                alerts += 1
+                break                    # nothing was claimed (the claim itself failed): stop
+            if claimed in import_ids:
+                import_raised += 1
+            if outcomes is not None:
+                outcomes.append((claimed, "raised"))
+            try:
+                if dry_run:
+                    c2 = conn.cursor()
+                    c2.execute("SELECT attempts FROM library_capture_queue WHERE id = %s", [claimed])
+                    before = int(c2.fetchone()[0])
+                    conn.rollback()
+                else:
+                    before = record_error(conn, claimed, name)
+            except Exception as e2:  # noqa: BLE001
+                conn.rollback()
+                print(f"  [error]   queue={claimed} the attempt was not recorded: "
+                      f"{e2.__class__.__name__}")
+                alerts += 1
                 break
+            if before == 0:
+                alerts += 1              # the row's first failure: the run exits non-zero
+            continue
         if outcome is not None:
             counts[outcome] += 1
+            if qid in import_ids:
+                import_counts[outcome] += 1
+            if outcomes is not None:
+                outcomes.append((qid, outcome))
 
-    for paper_id in _revalidate_after_commit:
-        trigger_revalidation(paper_id)
+    for paper_id, from_import in _revalidate_after_commit:
+        trigger_revalidation(paper_id, from_import=from_import)
+
+    if budget_spent:
+        cur = conn.cursor()
+        cur.execute(f"SELECT count(*) FROM library_capture_queue WHERE {CLAIM_PREDICATE} AND {IMPORT_ORIGIN} "
+                    "AND id <> ALL(%s::uuid[])", [seen])
+        left = cur.fetchone()[0]
+        conn.rollback()
+        print(f"[drain] import budget of {IMPORT_BUDGET_S} s spent; {left} import row(s) left for the next run")
 
     if dry_run:
         print("[dry-run] no writes performed")
-    print(" ".join(f"{k}={counts[k]}" for k in OUTCOMES))
-    return counts
+    print(" ".join(f"{k}={counts[k]}" for k in OUTCOMES) + f" raised={raised}")
+    print("import rows: " + " ".join(f"{k}={import_counts[k]}" for k in OUTCOMES)
+          + f" raised={import_raised}")
+    return {**counts, "raised": raised, "alerts": alerts}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -638,10 +777,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     conn.autocommit = False
     try:
-        run(conn, dry_run=a.dry_run, limit=a.limit, network=not a.no_network)
+        counts = run(conn, dry_run=a.dry_run, limit=a.limit, network=not a.no_network)
     finally:
         conn.close()
-    return 0
+    return 1 if counts["alerts"] else 0
 
 
 if __name__ == "__main__":
