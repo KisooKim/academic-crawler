@@ -77,7 +77,16 @@ DENORM_COUNTS = [("upvote_count", "paper_upvotes"), ("comment_count", "paper_com
 # `author_link_moves` (050) logs provisional-author link moves by (author_id, paper_id) with no FK to
 # papers; the generic pass moves a loser's entries to the winner and drops one that collides on the
 # primary key (the winner already has an entry for that author).
-FK_LESS_ALLOWLIST: set[str] = {"author_link_conflicts", "author_link_moves", "author_link_staging"}
+# `taste_negatives` (060) has no FK by design (taste engine contracts v1.2, "Negatives",
+# docs/TASTE_ENGINE_CONTRACTS.md): a paper deleted outright must not delete a negative, and readers drop
+# a negative whose paper is gone. A merge re-points it in `merge_taste_negatives`, before the generic pass.
+FK_LESS_ALLOWLIST: set[str] = {"author_link_conflicts", "author_link_moves", "author_link_staging",
+                               "taste_negatives"}
+
+# Tables whose rows may outlive their paper by design: a paper deleted outright leaves its negatives
+# behind (above). `orphan_report` leaves them out of its zero-orphan count, and `orphans_by_design`
+# counts them on their own.
+ORPHANS_BY_DESIGN: set[str] = {"taste_negatives"}
 
 # Child tables of `library_items` (keyed by library_item_id, not paper_id, so the paper_id
 # scan never sees them). The bespoke handler re-points them explicitly. A child table found
@@ -809,16 +818,11 @@ def merge(conn, loser: str, winner: str, reason: str | None, dry: bool = False) 
     return stats
 
 
-def orphan_report(conn) -> dict[str, int]:
-    """Zero-orphan assertion across EVERY referencing table (the G-038 closure artifact).
-
-    `x.paper_id IS NOT NULL` is load-bearing since 039: `library_items.paper_id` is NULLABLE
-    (external non-corpus items, and the merge's own released tombstones). Without the guard,
-    NOT EXISTS treats every NULL as unmatched and reports legitimate rows as orphans.
-    """
+def _orphans(conn, tables) -> dict[str, int]:
+    """Rows whose non-null paper_id names no paper, per table (only tables with any)."""
     cur = conn.cursor()
     out = {}
-    for t in referencing_tables(cur):
+    for t in tables:
         cur.execute(f'SELECT count(*) FROM "{t}" x WHERE x.paper_id IS NOT NULL AND NOT EXISTS '
                     f'(SELECT 1 FROM papers p WHERE p.id = x.paper_id)')
         n = cur.fetchone()[0]
@@ -826,6 +830,28 @@ def orphan_report(conn) -> dict[str, int]:
             out[t] = n
     cur.close()
     return out
+
+
+def orphan_report(conn) -> dict[str, int]:
+    """Zero-orphan assertion across every referencing table except ORPHANS_BY_DESIGN (the G-038
+    closure artifact).
+
+    `x.paper_id IS NOT NULL` is load-bearing since 039: `library_items.paper_id` is NULLABLE
+    (external non-corpus items, and the merge's own released tombstones). Without the guard,
+    NOT EXISTS treats every NULL as unmatched and reports legitimate rows as orphans.
+    """
+    cur = conn.cursor()
+    tables = [t for t in referencing_tables(cur) if t not in ORPHANS_BY_DESIGN]
+    cur.close()
+    return _orphans(conn, tables)
+
+
+def orphans_by_design(conn) -> dict[str, int]:
+    """The rows of ORPHANS_BY_DESIGN whose paper is gone, counted apart from `orphan_report`."""
+    cur = conn.cursor()
+    tables = [t for t in referencing_tables(cur) if t in ORPHANS_BY_DESIGN]
+    cur.close()
+    return _orphans(conn, tables)
 
 
 def main() -> int:
@@ -859,6 +885,9 @@ def main() -> int:
         print(f"  {t:<28} {s}")
     orph = orphan_report(conn)
     print(f"[orphans] {orph or 'none — 0 across all referencing tables'}")
+    by_design = orphans_by_design(conn)
+    if by_design:
+        print(f"[orphans by design, not a failure] {by_design}")
     conn.close()
     return 1 if orph else 0
 
