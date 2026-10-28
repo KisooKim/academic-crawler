@@ -1,6 +1,6 @@
 {
-  "CONFIG_VERSION": "taste-cfg-1",
-  "CONFIG_HASH": "4cbe6ed43e981bfb2f871a0555ef1705ddf547ada485a268a0f6d156b6bb93cb",
+  "CONFIG_VERSION": "taste-cfg-2",
+  "CONFIG_HASH": "b42ede020ccc25f3f629629b7a3fc38afd4813a14358ddcadefc503176abc6f6",
   "ENGINE_IDS": {
     "cardSelector": "card-selector@1",
     "exampleBuilder": "example-builder@1",
@@ -15,7 +15,7 @@
     "seeds": 10,
     "weights": {
       "pick": 1,
-      "seed": 1,
+      "seed": 0.1,
       "own": 1,
       "none": 1,
       "unpicked": 0,
